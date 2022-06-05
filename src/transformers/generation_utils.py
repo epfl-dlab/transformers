@@ -26,7 +26,7 @@ from torch import nn
 
 import mctx
 from mctx._src import qtransforms
-from mctx._src.base import QTransform
+from mctx._src import base as mctx_base
 from .file_utils import ModelOutput
 from .generation_beam_search import BeamScorer, BeamSearchScorer
 from .generation_logits_process import (
@@ -358,6 +358,25 @@ class BeamSampleEncoderDecoderOutput(ModelOutput):
     decoder_hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
 
 
+@dataclass
+class MCTSOutput(ModelOutput):
+    """
+    Base class for outputs of generation models using Monte Carlo Tree Search.
+
+
+    Args:
+        sequences (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`):
+            The generated sequences. The second dimension (sequence_length) is either equal to :obj:`max_length` or
+            shorter if all batches finished early due to the :obj:`eos_token_id`.
+        policy_output (:obj:`PolicyOutput`):
+            The output of the MCTX policy. Contains the MCTS search tree and actions taken when generating
+            the sequences.
+    """
+
+    sequences: torch.LongTensor = None
+    policy_output: mctx_base.PolicyOutput = None
+
+
 GreedySearchOutput = Union[GreedySearchEncoderDecoderOutput, GreedySearchDecoderOnlyOutput]
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 BeamSearchOutput = Union[BeamSearchEncoderDecoderOutput, BeamSearchDecoderOnlyOutput]
@@ -681,7 +700,7 @@ class GenerationMixin:
         remove_invalid_values: Optional[bool] = None,
         synced_gpus: Optional[bool] = None,
         use_mcts: bool = False,
-        mcts_qtransform: QTransform = qtransforms.qtransform_by_parent_and_siblings,
+        mcts_qtransform: mctx_base.QTransform = qtransforms.qtransform_by_parent_and_siblings,
         mcts_dirichlet_fraction: chex.Numeric = 0.25,
         mcts_dirichlet_alpha: chex.Numeric = 0.3,
         mcts_pb_c_init: chex.Numeric = 1.25,
@@ -689,7 +708,7 @@ class GenerationMixin:
         mcts_num_simulations: int = 30,
         mcts_topk_actions: Optional[int] = None,
         **model_kwargs,
-    ) -> Union[GreedySearchOutput, SampleOutput, BeamSearchOutput, BeamSampleOutput, torch.LongTensor]:
+    ) -> Union[GreedySearchOutput, SampleOutput, BeamSearchOutput, BeamSampleOutput, MCTSOutput, torch.LongTensor]:
         r"""
         Generates sequences for models with a language modeling head. The method currently supports greedy decoding,
         multinomial sampling, beam-search decoding, and beam-search multinomial sampling.
@@ -1170,7 +1189,8 @@ class GenerationMixin:
                     "Only `batch_size=1` is supported by MCTS in generate."
                     " To support working with batches, models should support"
                     " left padding in the decoder. That might not be possible"
-                    " for encoder-decoder models.")
+                    " for encoder-decoder models."
+                )
 
             if top_k is not None and top_k != 0:
                 if mcts_topk_actions:
@@ -1183,19 +1203,19 @@ class GenerationMixin:
             if top_p is not None and top_p < 1.0:
                 logits_processor.append(TopPLogitsWarper(top_p=top_p))
 
-            max_depth = self.config.max_position_embeddings if "max_position_embeddings" in self.config else None
+            # TODO Do all models have max_position_embeddings?
+            #  How to determine the maximum input length of the model?
+            max_depth = self.config.max_position_embeddings
 
             # TODO support stopping criteria
             # stopping_criteria: Optional[StoppingCriteriaList] = None,
 
             root = self.mcts_root_fn(
-                input_ids=input_ids,
-                logits_processor=logits_processor,
-                topk_actions=mcts_topk_actions,
-                **model_kwargs
+                input_ids=input_ids, logits_processor=logits_processor, topk_actions=mcts_topk_actions, **model_kwargs
             )
 
             print(f"Calling the mctx.muzero_policy to get MCTS simulation results")
+            # TODO should this call be JAX-ed?
             policy_output = mctx.muzero_policy_for_action_sequence(
                 params=(),
                 rng_key=jax.random.PRNGKey(0),
@@ -1213,23 +1233,17 @@ class GenerationMixin:
                 temperature=temperature if temperature is not None else 1.0,
             )
 
-            # TODO call finalize to create the outputs from cache
-            class Object:
-                pass
+            # TODO not all actions might be used from the policy_output if early stopping was used
+            return self.mcts_finalize(policy_output)
 
-            output = Object()
-            output.sequences = [[1, 2, 3] * num_return_sequences]
-            output.policy_output = policy_output
-
-            # TODO: does jit work
-
-            return output
-
-    def mcts_root_fn(self, **kwargs):
+    def mcts_root_fn(self, **kwargs) -> mctx_base.RootFnOutput:
         raise NotImplementedError("This method needs to be implemented on a per-model basis for MCTS to be supported.")
 
-    def mcts_recurrent_fn(self, **kwargs):
+    def mcts_recurrent_fn(self, **kwargs) -> Tuple[mctx_base.RecurrentFnOutput, mctx_base.RecurrentState]:
         # TODO consider refactor to write generic root and recurrent functions
+        raise NotImplementedError("This method needs to be implemented on a per-model basis for MCTS to be supported.")
+
+    def mcts_finalize(self, policy_output, **kwargs) -> MCTSOutput:
         raise NotImplementedError("This method needs to be implemented on a per-model basis for MCTS to be supported.")
 
     def greedy_search(
