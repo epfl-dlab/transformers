@@ -18,10 +18,15 @@ import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
+import chex
+import jax
 import torch
 import torch.distributed as dist
 from torch import nn
 
+import mctx
+from mctx._src import qtransforms
+from mctx._src.base import QTransform
 from .file_utils import ModelOutput
 from .generation_beam_search import BeamScorer, BeamSearchScorer
 from .generation_logits_process import (
@@ -48,7 +53,6 @@ from .generation_stopping_criteria import (
     validate_stopping_criteria,
 )
 from .utils import logging
-
 
 logger = logging.get_logger(__name__)
 
@@ -676,6 +680,14 @@ class GenerationMixin:
         forced_eos_token_id: Optional[int] = None,
         remove_invalid_values: Optional[bool] = None,
         synced_gpus: Optional[bool] = None,
+        use_mcts: bool = False,
+        mcts_qtransform: QTransform = qtransforms.qtransform_by_parent_and_siblings,
+        mcts_dirichlet_fraction: chex.Numeric = 0.25,
+        mcts_dirichlet_alpha: chex.Numeric = 0.3,
+        mcts_pb_c_init: chex.Numeric = 1.25,
+        mcts_pb_c_base: chex.Numeric = 19652,
+        mcts_num_simulations: int = 30,
+        mcts_topk_actions: Optional[int] = None,
         **model_kwargs,
     ) -> Union[GreedySearchOutput, SampleOutput, BeamSearchOutput, BeamSampleOutput, torch.LongTensor]:
         r"""
@@ -940,17 +952,25 @@ class GenerationMixin:
             )
 
         # determine generation mode
-        is_greedy_gen_mode = (num_beams == 1) and (num_beam_groups == 1) and do_sample is False
-        is_sample_gen_mode = (num_beams == 1) and (num_beam_groups == 1) and do_sample is True
-        is_beam_gen_mode = (num_beams > 1) and (num_beam_groups == 1) and do_sample is False
-        is_beam_sample_gen_mode = (num_beams > 1) and (num_beam_groups == 1) and do_sample is True
-        is_group_beam_gen_mode = (num_beams > 1) and (num_beam_groups > 1)
-        if num_beam_groups > num_beams:
-            raise ValueError("`num_beam_groups` has to be smaller or equal to `num_beams`")
-        if is_group_beam_gen_mode and do_sample is True:
-            raise ValueError(
-                "Diverse beam search cannot be used in sampling mode. Make sure that `do_sample` is set to `False`."
-            )
+        if use_mcts:
+            is_mcts = True
+            is_greedy_gen_mode = False
+            is_sample_gen_mode = False
+            is_beam_gen_mode = False
+            is_beam_sample_gen_mode = False
+            is_group_beam_gen_mode = False
+        else:
+            is_greedy_gen_mode = (num_beams == 1) and (num_beam_groups == 1) and do_sample is False
+            is_sample_gen_mode = (num_beams == 1) and (num_beam_groups == 1) and do_sample is True
+            is_beam_gen_mode = (num_beams > 1) and (num_beam_groups == 1) and do_sample is False
+            is_beam_sample_gen_mode = (num_beams > 1) and (num_beam_groups == 1) and do_sample is True
+            is_group_beam_gen_mode = (num_beams > 1) and (num_beam_groups > 1)
+            if num_beam_groups > num_beams:
+                raise ValueError("`num_beam_groups` has to be smaller or equal to `num_beams`")
+            if is_group_beam_gen_mode and do_sample is True:
+                raise ValueError(
+                    "Diverse beam search cannot be used in sampling mode. Make sure that `do_sample` is set to `False`."
+                )
 
         # set model_kwargs
         model_kwargs["use_cache"] = use_cache
@@ -1144,6 +1164,73 @@ class GenerationMixin:
                 synced_gpus=synced_gpus,
                 **model_kwargs,
             )
+        elif is_mcts:
+            if input_ids.shape[0] > 1:
+                raise NotImplementedError(
+                    "Only `batch_size=1` is supported by MCTS in generate."
+                    " To support working with batches, models should support"
+                    " left padding in the decoder. That might not be possible"
+                    " for encoder-decoder models.")
+
+            if top_k is not None and top_k != 0:
+                if mcts_topk_actions:
+                    # TODO top_k and mcts_topk_actions should be the same argument.
+                    #  They are separated only for testing if mcts_topk_actions is
+                    #  implemented correctly in lmcache
+                    assert top_k == mcts_topk_actions
+                logits_processor.append(TopKLogitsWarper(top_k=top_k))
+
+            if top_p is not None and top_p < 1.0:
+                logits_processor.append(TopPLogitsWarper(top_p=top_p))
+
+            max_depth = self.config.max_position_embeddings if "max_position_embeddings" in self.config else None
+
+            # TODO support stopping criteria
+            # stopping_criteria: Optional[StoppingCriteriaList] = None,
+
+            root = self.mcts_root_fn(
+                input_ids=input_ids,
+                logits_processor=logits_processor,
+                topk_actions=mcts_topk_actions,
+                **model_kwargs
+            )
+
+            print(f"Calling the mctx.muzero_policy to get MCTS simulation results")
+            policy_output = mctx.muzero_policy_for_action_sequence(
+                params=(),
+                rng_key=jax.random.PRNGKey(0),
+                root=root,
+                recurrent_fn=self.mcts_recurrent_fn,
+                num_simulations=mcts_num_simulations,
+                num_actions_to_generate=max_length,
+                pb_c_init=mcts_pb_c_init,
+                pb_c_base=mcts_pb_c_base,
+                dirichlet_fraction=mcts_dirichlet_fraction,
+                dirichlet_alpha=mcts_dirichlet_alpha,
+                qtransform=mcts_qtransform,
+                max_depth=max_depth,
+                invalid_actions=None,
+                temperature=temperature if temperature is not None else 1.0,
+            )
+
+            # TODO call finalize to create the outputs from cache
+            class Object:
+                pass
+
+            output = Object()
+            output.sequences = [[1, 2, 3] * num_return_sequences]
+            output.policy_output = policy_output
+
+            # TODO: does jit work
+
+            return output
+
+    def mcts_root_fn(self, **kwargs):
+        raise NotImplementedError("This method needs to be implemented on a per-model basis for MCTS to be supported.")
+
+    def mcts_recurrent_fn(self, **kwargs):
+        # TODO consider refactor to write generic root and recurrent functions
+        raise NotImplementedError("This method needs to be implemented on a per-model basis for MCTS to be supported.")
 
     def greedy_search(
         self,
