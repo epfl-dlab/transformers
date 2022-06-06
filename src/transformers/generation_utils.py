@@ -25,8 +25,10 @@ import torch.distributed as dist
 from torch import nn
 
 import mctx
-from mctx._src import qtransforms
+from mctx import PolicyOutput
 from mctx._src import base as mctx_base
+from mctx._src import qtransforms
+from src.mdp.evaluation_models import EvaluationModel
 from .file_utils import ModelOutput
 from .generation_beam_search import BeamScorer, BeamSearchScorer
 from .generation_logits_process import (
@@ -707,6 +709,7 @@ class GenerationMixin:
         mcts_pb_c_base: chex.Numeric = 19652,
         mcts_num_simulations: int = 30,
         mcts_topk_actions: Optional[int] = None,
+        mcts_value_model: EvaluationModel = None,
         **model_kwargs,
     ) -> Union[GreedySearchOutput, SampleOutput, BeamSearchOutput, BeamSampleOutput, MCTSOutput, torch.LongTensor]:
         r"""
@@ -1192,6 +1195,9 @@ class GenerationMixin:
                     " for encoder-decoder models."
                 )
 
+            if mcts_value_model is None:
+                raise ValueError("The value function is not optional for MCTS.")
+
             if top_k is not None and top_k != 0:
                 if mcts_topk_actions:
                     # TODO top_k and mcts_topk_actions should be the same argument.
@@ -1211,7 +1217,11 @@ class GenerationMixin:
             # stopping_criteria: Optional[StoppingCriteriaList] = None,
 
             root = self.mcts_root_fn(
-                input_ids=input_ids, logits_processor=logits_processor, topk_actions=mcts_topk_actions, **model_kwargs
+                input_ids=input_ids,
+                mcts_value_model=mcts_value_model,
+                logits_processor=logits_processor,
+                topk_actions=mcts_topk_actions,
+                **model_kwargs,
             )
 
             print(f"Calling the mctx.muzero_policy to get MCTS simulation results")
@@ -1234,16 +1244,16 @@ class GenerationMixin:
             )
 
             # TODO not all actions might be used from the policy_output if early stopping was used
-            return self.mcts_finalize(policy_output)
+            return self.mcts_finalize(policy_output=policy_output)
 
-    def mcts_root_fn(self, **kwargs) -> mctx_base.RootFnOutput:
+    def mcts_root_fn(self, value_model: EvaluationModel, **kwargs) -> mctx_base.RootFnOutput:
         raise NotImplementedError("This method needs to be implemented on a per-model basis for MCTS to be supported.")
 
     def mcts_recurrent_fn(self, **kwargs) -> Tuple[mctx_base.RecurrentFnOutput, mctx_base.RecurrentState]:
         # TODO consider refactor to write generic root and recurrent functions
         raise NotImplementedError("This method needs to be implemented on a per-model basis for MCTS to be supported.")
 
-    def mcts_finalize(self, policy_output, **kwargs) -> MCTSOutput:
+    def mcts_finalize(self, policy_output: PolicyOutput, **kwargs) -> MCTSOutput:
         raise NotImplementedError("This method needs to be implemented on a per-model basis for MCTS to be supported.")
 
     def greedy_search(
