@@ -430,7 +430,6 @@ class StochasticBeamSearchScorer(BeamScorer):
         batch_size: int,
         num_beams: int,
         device: torch.device,
-        do_length_normalization: Optional[bool] = True,
         length_penalty: Optional[float] = 1.0,
         do_early_stopping: Optional[bool] = False,
         num_beam_hyps_to_keep: Optional[int] = 1,
@@ -439,7 +438,6 @@ class StochasticBeamSearchScorer(BeamScorer):
     ):
         self.num_beams = num_beams
         self.device = device
-        self.do_length_normalization = do_length_normalization
         self.length_penalty = length_penalty
         self.do_early_stopping = do_early_stopping
         self.num_beam_hyps_to_keep = num_beam_hyps_to_keep
@@ -450,7 +448,6 @@ class StochasticBeamSearchScorer(BeamScorer):
         self._beam_hyps = [
             StochasticBeamHypotheses(
                 num_beams=self.num_beams,
-                length_normalization=self.do_length_normalization,
                 length_penalty=self.length_penalty,
                 early_stopping=self.do_early_stopping,
             )
@@ -631,31 +628,16 @@ class StochasticBeamSearchScorer(BeamScorer):
         )
 
 
-class StochasticBeamHypotheses:
-    def __init__(self, num_beams: int, length_normalization: bool, length_penalty: float, early_stopping: bool):
-        """
-        Initialize n-best list of hypotheses.
-        """
-        self.length_normalization = length_normalization
-        self.length_penalty = length_penalty
-        self.early_stopping = early_stopping
-        self.num_beams = num_beams
-        self.beams = []
-        self.worst_score = 1e9
-
-    def __len__(self):
-        """
-        Number of hypotheses in the list.
-        """
-        return len(self.beams)
+class StochasticBeamHypotheses(BeamHypotheses):
+    def __init__(self, num_beams: int, length_penalty: float, early_stopping: bool):
+        super().__init__(num_beams, length_penalty, early_stopping)
 
     def add(self, hyp: torch.LongTensor, sum_logprobs: float, gumbel: float):
         """
         Add a new hypothesis to the list.
         """
-        normalization_factor = hyp.shape[-1] ** self.length_penalty if self.length_normalization else 1.0
-        score = sum_logprobs / normalization_factor
-        gumbel_score = gumbel / normalization_factor
+        score = sum_logprobs / (hyp.shape[-1] ** self.length_penalty)
+        gumbel_score = gumbel / (hyp.shape[-1] ** self.length_penalty)
         if len(self) < self.num_beams or gumbel_score > self.worst_score:
             self.beams.append((gumbel_score, score, hyp))
             if len(self) > self.num_beams:
@@ -676,7 +658,6 @@ class StochasticBeamHypotheses:
         elif self.early_stopping:
             return True
         else:
-            normalization_factor = cur_len ** self.length_penalty if self.length_normalization else 1.0
-            cur_score = best_gumbel / normalization_factor
+            cur_score = best_gumbel / cur_len ** self.length_penalty
             ret = self.worst_score >= cur_score
             return ret

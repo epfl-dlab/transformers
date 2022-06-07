@@ -704,7 +704,6 @@ class GenerationMixin:
         min_length: Optional[int] = None,
         do_sample: Optional[bool] = None,
         do_stochastic: Optional[bool] = None,
-        length_normalization: Optional[bool] = True,
         early_stopping: Optional[bool] = None,
         num_beams: Optional[int] = None,
         temperature: Optional[float] = None,
@@ -1184,12 +1183,8 @@ class GenerationMixin:
 
             batch_size = input_ids.shape[0]
 
-            if length_normalization:
-                length_penalty = length_penalty if length_penalty is not None else self.hf_model.config.length_penalty
-            else:
-                length_penalty = None
-
-            early_stopping = early_stopping if early_stopping is not None else self.hf_model.config.early_stopping
+            length_penalty = length_penalty if length_penalty is not None else self.config.length_penalty
+            early_stopping = early_stopping if early_stopping is not None else self.config.early_stopping
 
             if num_return_sequences > num_beams:
                 raise ValueError("`num_return_sequences` has to be smaller or equal to `num_beams`.")
@@ -1201,14 +1196,13 @@ class GenerationMixin:
                 batch_size=batch_size,
                 num_beams=num_beams,
                 device=self.device,
-                do_length_normalization=length_normalization,
                 length_penalty=length_penalty,
                 do_early_stopping=early_stopping,
                 num_beam_hyps_to_keep=num_return_sequences,
             )
             # interleave with `num_beams`
             input_ids, model_kwargs = self._expand_inputs_for_generation(
-                input_ids, expand_size=num_beams, is_encoder_decoder=self.hf_model.config.is_encoder_decoder, **model_kwargs
+                input_ids, expand_size=num_beams, is_encoder_decoder=self.config.is_encoder_decoder, **model_kwargs
             )
             return self.stochastic_beam_search(
                 input_ids,
@@ -2422,15 +2416,15 @@ class GenerationMixin:
             stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
         if len(stopping_criteria) == 0:
             warnings.warn("You don't have defined any stopping_criteria, this will likely loop forever", UserWarning)
-        pad_token_id = pad_token_id if pad_token_id is not None else self.hf_model.config.pad_token_id
-        eos_token_id = eos_token_id if eos_token_id is not None else self.hf_model.config.eos_token_id
-        output_scores = output_scores if output_scores is not None else self.hf_model.config.output_scores
-        output_attentions = output_attentions if output_attentions is not None else self.hf_model.config.output_attentions
+        pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
+        eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
+        output_scores = output_scores if output_scores is not None else self.config.output_scores
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.hf_model.config.output_hidden_states
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict_in_generate = (
-            return_dict_in_generate if return_dict_in_generate is not None else self.hf_model.config.return_dict_in_generate
+            return_dict_in_generate if return_dict_in_generate is not None else self.config.return_dict_in_generate
         )
 
         # init attention / hidden states / scores tuples
@@ -2442,7 +2436,7 @@ class GenerationMixin:
         decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
 
         # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
-        if return_dict_in_generate and self.hf_model.config.is_encoder_decoder:
+        if return_dict_in_generate and self.config.is_encoder_decoder:
             encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
             encoder_hidden_states = (
                 model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
@@ -2480,7 +2474,7 @@ class GenerationMixin:
 
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
-            outputs = self.hf_model(
+            outputs = self(
                 **model_inputs,
                 return_dict=True,
                 output_attentions=output_attentions,
@@ -2514,15 +2508,15 @@ class GenerationMixin:
                     gumbels += (next_token_gumbels,)
                 if output_attentions:
                     decoder_attentions += (
-                        (outputs.decoder_attentions,) if self.hf_model.config.is_encoder_decoder else (outputs.attentions,)
+                        (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
                     )
-                    if self.hf_model.config.is_encoder_decoder:
+                    if self.config.is_encoder_decoder:
                         cross_attentions += (outputs.cross_attentions,)
 
                 if output_hidden_states:
                     decoder_hidden_states += (
                         (outputs.decoder_hidden_states,)
-                        if self.hf_model.config.is_encoder_decoder
+                        if self.config.is_encoder_decoder
                         else (outputs.hidden_states,)
                     )
 
@@ -2560,7 +2554,7 @@ class GenerationMixin:
             input_ids = torch.cat([input_ids[beam_idx, :], beam_next_tokens.unsqueeze(-1)], dim=-1)
 
             model_kwargs = self._update_model_kwargs_for_generation(
-                outputs, model_kwargs, is_encoder_decoder=self.hf_model.config.is_encoder_decoder
+                outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
             if model_kwargs["past"] is not None:
                 model_kwargs["past"] = self._reorder_cache(model_kwargs["past"], beam_idx)
@@ -2589,7 +2583,7 @@ class GenerationMixin:
             if not output_scores:
                 sequence_outputs["sequence_scores"] = None
                 sequence_outputs["sequence_gumbels"] = None
-            if self.hf_model.config.is_encoder_decoder:
+            if self.config.is_encoder_decoder:
                 return StochasticBeamSearchEncoderDecoderOutput(
                     sequences=sequence_outputs["sequences"],
                     sequences_scores=sequence_outputs["sequence_scores"],
