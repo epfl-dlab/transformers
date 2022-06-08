@@ -665,6 +665,11 @@ class GenerationMixin:
             stopping_criteria.append(MaxNewTokensCriteria(start_length=start_length, max_new_tokens=max_new_tokens))
         return stopping_criteria
 
+    __mcts_jit_cache = None
+
+    def reset_mcts_jit_cache(self):
+        self.__mcts_jit_cache = None
+
     @torch.no_grad()
     def generate(
         self,
@@ -702,6 +707,8 @@ class GenerationMixin:
         remove_invalid_values: Optional[bool] = None,
         synced_gpus: Optional[bool] = None,
         use_mcts: bool = False,
+        reuse_cached_jitted_mcts: bool = False,
+        mcts_debug_prints: bool = False,
         mcts_qtransform: mctx_base.QTransform = qtransforms.qtransform_by_parent_and_siblings,
         mcts_dirichlet_fraction: chex.Numeric = 0.25,
         mcts_dirichlet_alpha: chex.Numeric = 0.3,
@@ -1209,39 +1216,54 @@ class GenerationMixin:
             if top_p is not None and top_p < 1.0:
                 logits_processor.append(TopPLogitsWarper(top_p=top_p))
 
+            if stopping_criteria.max_length is None:
+                raise ValueError("`max_length` needs to be a stopping_criteria for now.")
+
             # TODO Do all models have max_position_embeddings?
             #  How to determine the maximum input length of the model?
             max_depth = self.config.max_position_embeddings
 
-            # TODO support stopping criteria
-            # stopping_criteria: Optional[StoppingCriteriaList] = None,
+            def run_policy(root: mctx_base.RootFnOutput):
+                return mctx.muzero_policy_for_action_sequence(
+                    params=(),
+                    rng_key=jax.random.PRNGKey(0),
+                    root=root,
+                    recurrent_fn=self.mcts_recurrent_fn,
+                    stopping_criteria_fn=self.mcts_stopping_criteria_fn,
+                    num_simulations=mcts_num_simulations,
+                    num_actions_to_generate=stopping_criteria.max_length,
+                    pb_c_init=mcts_pb_c_init,
+                    pb_c_base=mcts_pb_c_base,
+                    dirichlet_fraction=mcts_dirichlet_fraction,
+                    dirichlet_alpha=mcts_dirichlet_alpha,
+                    qtransform=mcts_qtransform,
+                    max_depth=max_depth,
+                    invalid_actions=None,
+                    temperature=temperature if temperature is not None else 1.0,
+                )
 
             root = self.mcts_root_fn(
                 input_ids=input_ids,
                 mcts_value_model=mcts_value_model,
                 logits_processor=logits_processor,
                 topk_actions=mcts_topk_actions,
+                stopping_criteria=stopping_criteria,
+                mcts_debug_prints=mcts_debug_prints,
                 **model_kwargs,
             )
 
-            print(f"Calling the mctx.muzero_policy to get MCTS simulation results")
-            # TODO should this call be JAX-ed?
-            policy_output = mctx.muzero_policy_for_action_sequence(
-                params=(),
-                rng_key=jax.random.PRNGKey(0),
-                root=root,
-                recurrent_fn=self.mcts_recurrent_fn,
-                num_simulations=mcts_num_simulations,
-                num_actions_to_generate=max_length,
-                pb_c_init=mcts_pb_c_init,
-                pb_c_base=mcts_pb_c_base,
-                dirichlet_fraction=mcts_dirichlet_fraction,
-                dirichlet_alpha=mcts_dirichlet_alpha,
-                qtransform=mcts_qtransform,
-                max_depth=max_depth,
-                invalid_actions=None,
-                temperature=temperature if temperature is not None else 1.0,
-            )
+            if mcts_debug_prints:
+                print(f"Calling the mctx.muzero_policy to get MCTS simulation results")
+            if reuse_cached_jitted_mcts:
+                if self.__mcts_jit_cache is None:
+                    self.__mcts_jit_cache = jax.jit(run_policy)
+                else:
+                    if mcts_debug_prints:
+                        print("Reusing cached jitted MCTS policy.")
+                jitted_run_policy = self.__mcts_jit_cache
+            else:
+                jitted_run_policy = jax.jit(run_policy)
+            policy_output = jitted_run_policy(root)
 
             # TODO not all actions might be used from the policy_output if early stopping was used
             return self.mcts_finalize(policy_output=policy_output)
@@ -1254,6 +1276,9 @@ class GenerationMixin:
         raise NotImplementedError("This method needs to be implemented on a per-model basis for MCTS to be supported.")
 
     def mcts_finalize(self, policy_output: PolicyOutput, **kwargs) -> MCTSOutput:
+        raise NotImplementedError("This method needs to be implemented on a per-model basis for MCTS to be supported.")
+
+    def mcts_stopping_criteria_fn(self, embedding: mctx_base.RecurrentState) -> bool:
         raise NotImplementedError("This method needs to be implemented on a per-model basis for MCTS to be supported.")
 
     def greedy_search(
