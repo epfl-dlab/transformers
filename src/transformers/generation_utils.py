@@ -28,7 +28,6 @@ import mctx
 from mctx import PolicyOutput
 from mctx._src import base as mctx_base
 from mctx._src import qtransforms
-from src.mdp.evaluation_models import EvaluationModel
 from .file_utils import ModelOutput
 from .generation_beam_search import BeamScorer, BeamSearchScorer
 from .generation_logits_process import (
@@ -716,7 +715,7 @@ class GenerationMixin:
         mcts_pb_c_base: chex.Numeric = 19652,
         mcts_num_simulations: int = 30,
         mcts_topk_actions: Optional[int] = None,
-        mcts_value_model: EvaluationModel = None,
+        mcts_value_model = None,
         **model_kwargs,
     ) -> Union[GreedySearchOutput, SampleOutput, BeamSearchOutput, BeamSampleOutput, MCTSOutput, torch.LongTensor]:
         r"""
@@ -1197,6 +1196,7 @@ class GenerationMixin:
             if input_ids.shape[0] > 1:
                 raise NotImplementedError(
                     "Only `batch_size=1` is supported by MCTS in generate."
+                    f" Got input_ids.shape={input_ids.shape}."
                     " To support working with batches, models should support"
                     " left padding in the decoder. That might not be possible"
                     " for encoder-decoder models."
@@ -1244,7 +1244,7 @@ class GenerationMixin:
 
             root = self.mcts_root_fn(
                 input_ids=input_ids,
-                mcts_value_model=mcts_value_model,
+                value_model=mcts_value_model,
                 logits_processor=logits_processor,
                 topk_actions=mcts_topk_actions,
                 stopping_criteria=stopping_criteria,
@@ -1268,7 +1268,7 @@ class GenerationMixin:
             # TODO not all actions might be used from the policy_output if early stopping was used
             return self.mcts_finalize(policy_output=policy_output)
 
-    def mcts_root_fn(self, value_model: EvaluationModel, **kwargs) -> mctx_base.RootFnOutput:
+    def mcts_root_fn(self, value_model, **kwargs) -> mctx_base.RootFnOutput:
         raise NotImplementedError("This method needs to be implemented on a per-model basis for MCTS to be supported.")
 
     def mcts_recurrent_fn(self, **kwargs) -> Tuple[mctx_base.RecurrentFnOutput, mctx_base.RecurrentState]:
