@@ -595,7 +595,10 @@ class StochasticBeamSearchScorer(BeamScorer):
 
         # retrieve best hypotheses
         for i, beam_hyp in enumerate(self._beam_hyps):
-            sorted_hyps = sorted(beam_hyp.beams, key=lambda x: x[0])
+            # Gumbel top hypotheses
+            sorted_hyps = sorted(beam_hyp.beams, key=lambda x: x[0])[-self.num_beam_hyps_to_keep:]
+            # sort by unperturbed score
+            sorted_hyps = sorted(sorted_hyps, key=lambda x: x[1])
             for j in range(self.num_beam_hyps_to_keep):
                 best_hyp_tuple = sorted_hyps.pop()
                 best_gumbel, best_score, best_hyp = best_hyp_tuple

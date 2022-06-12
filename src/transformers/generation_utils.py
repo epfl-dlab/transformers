@@ -388,7 +388,6 @@ class StochasticBeamSearchDecoderOnlyOutput(ModelOutput):
     sequences_gumbels: Optional[torch.FloatTensor] = None
     scores: Optional[Tuple[torch.FloatTensor]] = None
     gumbels: Optional[Tuple[torch.FloatTensor]] = None
-    beam_gumbels: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
 
@@ -401,7 +400,6 @@ class StochasticBeamSearchEncoderDecoderOutput(ModelOutput):
     sequences_gumbels: Optional[torch.FloatTensor] = None
     scores: Optional[Tuple[torch.FloatTensor]] = None
     gumbels: Optional[Tuple[torch.FloatTensor]] = None
-    beam_gumbels: Optional[Tuple[torch.FloatTensor]] = None
     encoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
     encoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     decoder_attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
@@ -2430,7 +2428,6 @@ class GenerationMixin:
         # init attention / hidden states / scores tuples
         scores = () if (return_dict_in_generate and output_scores) else None
         gumbels = () if (return_dict_in_generate and output_scores) else None
-        beam_gumbels_record = () if (return_dict_in_generate and output_scores) else None
         decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
         cross_attentions = () if (return_dict_in_generate and output_attentions) else None
         decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
@@ -2548,9 +2545,6 @@ class GenerationMixin:
             beam_idx = beam_outputs["next_beam_indices"]
             beam_gumbels = beam_outputs["next_beam_gumbels"]
 
-            if return_dict_in_generate and output_scores:
-                beam_gumbels_record += (beam_gumbels,)
-
             input_ids = torch.cat([input_ids[beam_idx, :], beam_next_tokens.unsqueeze(-1)], dim=-1)
 
             model_kwargs = self._update_model_kwargs_for_generation(
@@ -2590,7 +2584,6 @@ class GenerationMixin:
                     sequences_gumbels=sequence_outputs["sequence_gumbels"],
                     scores=scores,
                     gumbels=gumbels,
-                    beam_gumbels=beam_gumbels_record,
                     encoder_attentions=encoder_attentions,
                     encoder_hidden_states=encoder_hidden_states,
                     decoder_attentions=decoder_attentions,
@@ -2604,7 +2597,6 @@ class GenerationMixin:
                     sequences_gumbels=sequence_outputs["sequence_gumbels"],
                     scores=scores,
                     gumbels=gumbels,
-                    beam_gumbels=beam_gumbels_record,
                     attentions=decoder_attentions,
                     hidden_states=decoder_hidden_states,
                 )
