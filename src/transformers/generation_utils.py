@@ -18,23 +18,25 @@ import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
-import chex
-import jax
 import torch
 import torch.distributed as dist
 from torch import nn
 
+import chex
+import jax
 import mctx
 from mctx import PolicyOutput
 from mctx._src import base as mctx_base
 from mctx._src import qtransforms
 from src.mdp.evaluation_models import EvaluationModel
+
 from .file_utils import ModelOutput
 from .generation_beam_search import BeamScorer, BeamSearchScorer, StochasticBeamSearchScorer
 from .generation_logits_process import (
     EncoderNoRepeatNGramLogitsProcessor,
     ForcedBOSTokenLogitsProcessor,
     ForcedEOSTokenLogitsProcessor,
+    GumbelLogitsWarper,
     HammingDiversityLogitsProcessor,
     InfNanRemoveLogitsProcessor,
     LogitsProcessorList,
@@ -46,7 +48,6 @@ from .generation_logits_process import (
     TemperatureLogitsWarper,
     TopKLogitsWarper,
     TopPLogitsWarper,
-    GumbelLogitsWarper,
 )
 from .generation_stopping_criteria import (
     MaxLengthCriteria,
@@ -56,6 +57,7 @@ from .generation_stopping_criteria import (
     validate_stopping_criteria,
 )
 from .utils import logging
+
 
 logger = logging.get_logger(__name__)
 
@@ -1014,9 +1016,24 @@ class GenerationMixin:
         else:
             is_greedy_gen_mode = (num_beams == 1) and (num_beam_groups == 1) and do_sample is False
             is_sample_gen_mode = (num_beams == 1) and (num_beam_groups == 1) and do_sample is True
-            is_beam_gen_mode = (num_beams > 1) and (num_beam_groups == 1) and do_sample is False
-            is_beam_sample_gen_mode = (num_beams > 1) and (num_beam_groups == 1) and do_sample is True
-            is_beam_stochastic_gen_mode = (num_beams > 1) and (num_beam_groups == 1) and do_stochastic is True
+
+            is_beam_gen_mode = False
+            is_beam_sample_gen_mode = False
+            is_beam_stochastic_gen_mode = False
+
+            if do_sample and do_stochastic:
+                raise ValueError(
+                    (
+                        "Only one of do_sample and do_stochastic can be specified. "
+                        "Found do_sample: {0}, do_stochastic: {1}".format(do_sample, do_stochastic)
+                    )
+                )
+            if not do_sample and not do_stochastic:
+                is_beam_gen_mode = (num_beams > 1) and (num_beam_groups == 1)
+            elif do_sample:
+                is_beam_sample_gen_mode = (num_beams > 1) and (num_beam_groups == 1)
+            elif do_stochastic:
+                is_beam_stochastic_gen_mode = (num_beams > 1) and (num_beam_groups == 1)
             is_group_beam_gen_mode = (num_beams > 1) and (num_beam_groups > 1)
             if num_beam_groups > num_beams:
                 raise ValueError("`num_beam_groups` has to be smaller or equal to `num_beams`")
@@ -1177,7 +1194,9 @@ class GenerationMixin:
             )
 
         elif is_beam_stochastic_gen_mode:
-            logits_warper = TemperatureLogitsWarper(temperature) if temperature is not None and temperature != 1.0 else None
+            logits_warper = self._get_logits_warper(
+                top_k=None, top_p=None, temperature=temperature, num_beams=num_beams
+            )
 
             batch_size = input_ids.shape[0]
 
@@ -2486,7 +2505,7 @@ class GenerationMixin:
             # hack: adjust tokens for Marian. For Marian we have to make sure that the `pad_token_id`
             # cannot be generated both before and after the `nn.functional.log_softmax` operation.
             next_token_logits = self.adjust_logits_during_generation(next_token_logits, cur_len=cur_len)
-            if logits_warper: # temperature
+            if logits_warper:  # temperature
                 next_token_logits = logits_warper(input_ids, next_token_logits)
 
             next_token_scores = nn.functional.log_softmax(
