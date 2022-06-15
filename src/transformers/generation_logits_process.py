@@ -593,3 +593,27 @@ class InfNanRemoveLogitsProcessor(LogitsProcessor):
         scores[scores == float("inf")] = torch.finfo(scores.dtype).max
 
         return scores
+
+
+class GumbelLogitsWarper(LogitsWarper):
+    r"""
+    :class:`transformers.LogitsWarper` that samples a set of gumbels which are conditioned on having `maximums`
+    along the last dimension.
+    See `this paper <http://proceedings.mlr.press/v97/kool19a/kool19a.pdf>`__ for more details.
+    """
+
+    def __call__(self, scores: torch.FloatTensor, maximums: torch.FloatTensor) -> torch.FloatTensor:
+        gumbel_scores = scores + self.gumbel(scores)
+        gumbel_scores = self.shift_gumbel_maximum(gumbel_scores, maximums)
+        return gumbel_scores
+
+    def gumbel(self, scores: torch.FloatTensor) -> torch.FloatTensor:
+        u = torch.rand_like(scores)
+        return -torch.log(-torch.log(u))
+
+    def shift_gumbel_maximum(self, gumbel_scores: torch.FloatTensor, maximums: torch.FloatTensor) -> torch.FloatTensor:
+        max_children, _ = gumbel_scores.max(-1)
+        u = maximums.unsqueeze(-1) - gumbel_scores + torch.log1p(
+            -torch.exp(gumbel_scores - max_children.unsqueeze(-1))
+        )
+        return maximums.unsqueeze(-1) - torch.nn.functional.relu(u) - torch.log1p(torch.exp(-u.abs()))
