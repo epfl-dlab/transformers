@@ -28,7 +28,6 @@ import mctx
 from mctx import PolicyOutput
 from mctx._src import base as mctx_base
 from mctx._src import qtransforms
-from src.mdp.evaluation_models import EvaluationModel
 
 from .file_utils import ModelOutput
 from .generation_beam_search import BeamScorer, BeamSearchScorer, StochasticBeamSearchScorer
@@ -1020,6 +1019,7 @@ class GenerationMixin:
             is_beam_gen_mode = False
             is_beam_sample_gen_mode = False
             is_group_beam_gen_mode = False
+            is_beam_stochastic_gen_mode = False
         else:
             is_greedy_gen_mode = (num_beams == 1) and (num_beam_groups == 1) and do_sample is False
             is_sample_gen_mode = (num_beams == 1) and (num_beam_groups == 1) and do_sample is True
