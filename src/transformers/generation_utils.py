@@ -28,7 +28,6 @@ import mctx
 from mctx import PolicyOutput
 from mctx._src import base as mctx_base
 from mctx._src import qtransforms
-from src.mdp.evaluation_models import EvaluationModel
 
 from .file_utils import ModelOutput
 from .generation_beam_search import BeamScorer, BeamSearchScorer, StochasticBeamSearchScorer
@@ -1020,6 +1019,7 @@ class GenerationMixin:
             is_beam_gen_mode = False
             is_beam_sample_gen_mode = False
             is_group_beam_gen_mode = False
+            is_beam_stochastic_gen_mode = False
         else:
             is_greedy_gen_mode = (num_beams == 1) and (num_beam_groups == 1) and do_sample is False
             is_sample_gen_mode = (num_beams == 1) and (num_beam_groups == 1) and do_sample is True
@@ -1201,9 +1201,7 @@ class GenerationMixin:
             )
 
         elif is_beam_stochastic_gen_mode:
-            logits_warper = self._get_logits_warper(
-                top_k=None, top_p=None, temperature=temperature, num_beams=num_beams
-            )
+            logits_warper = TemperatureLogitsWarper(temperature) if temperature is not None and temperature != 1.0 else None
 
             batch_size = input_ids.shape[0]
 
