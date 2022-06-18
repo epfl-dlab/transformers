@@ -1021,6 +1021,7 @@ class GenerationMixin:
             is_group_beam_gen_mode = False
             is_beam_stochastic_gen_mode = False
         else:
+            is_mcts = False
             is_greedy_gen_mode = (num_beams == 1) and (num_beam_groups == 1) and do_sample is False
             is_sample_gen_mode = (num_beams == 1) and (num_beam_groups == 1) and do_sample is True
 
@@ -1202,7 +1203,7 @@ class GenerationMixin:
 
         elif is_beam_stochastic_gen_mode:
             logits_warper = self._get_logits_warper(
-                top_k=None, top_p=None, temperature=temperature, num_beams=num_beams
+                top_k=0, top_p=1, temperature=temperature, num_beams=num_beams
             )
 
             batch_size = input_ids.shape[0]
@@ -2433,7 +2434,7 @@ class GenerationMixin:
     def stochastic_beam_search(
         self,
         input_ids: torch.LongTensor,
-        beam_scorer: BeamScorer,
+        beam_scorer: StochasticBeamSearchScorer,
         logits_processor: Optional[LogitsProcessorList] = None,
         stopping_criteria: Optional[StoppingCriteriaList] = None,
         logits_warper: Optional[LogitsProcessorList] = None,
@@ -2531,8 +2532,6 @@ class GenerationMixin:
             # hack: adjust tokens for Marian. For Marian we have to make sure that the `pad_token_id`
             # cannot be generated both before and after the `nn.functional.log_softmax` operation.
             next_token_logits = self.adjust_logits_during_generation(next_token_logits, cur_len=cur_len)
-            if logits_warper:  # temperature
-                next_token_logits = logits_warper(input_ids, next_token_logits)
 
             next_token_scores = nn.functional.log_softmax(
                 next_token_logits, dim=-1
@@ -2540,6 +2539,7 @@ class GenerationMixin:
 
             next_token_scores = logits_processor(input_ids, next_token_scores)
             next_token_scores = next_token_scores + beam_scores[:, None].expand_as(next_token_scores)
+            next_token_scores = logits_warper(input_ids, next_token_scores)
 
             next_token_gumbels = gumbel_logits_warper(next_token_scores, beam_gumbels)
 
