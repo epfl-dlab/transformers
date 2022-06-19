@@ -13,7 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
@@ -1049,6 +1048,9 @@ class GenerationMixin:
                 raise ValueError(
                     "Diverse beam search cannot be used in sampling mode. Make sure that `do_sample` is set to `False`."
                 )
+
+        assert sum([is_mcts, is_greedy_gen_mode, is_sample_gen_mode, is_beam_gen_mode,
+                    is_beam_sample_gen_mode, is_group_beam_gen_mode, is_beam_stochastic_gen_mode]) == 1
 
         # set model_kwargs
         model_kwargs["use_cache"] = use_cache
