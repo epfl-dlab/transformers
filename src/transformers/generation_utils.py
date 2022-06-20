@@ -383,25 +383,31 @@ class MCTSOutput(ModelOutput):
 
 
 @dataclass
-class StochasticBeamSearchDecoderOnlyOutput(ModelOutput):
+class CustomScoreBeamSearchDecoderOnlyOutput(ModelOutput):
+    """
+    TODO
+    """
 
     sequences: torch.LongTensor = None
     sequences_scores: Optional[torch.FloatTensor] = None
-    sequences_gumbels: Optional[torch.FloatTensor] = None
+    sequences_custom_scores: Optional[torch.FloatTensor] = None
     scores: Optional[Tuple[torch.FloatTensor]] = None
-    gumbels: Optional[Tuple[torch.FloatTensor]] = None
+    custom_scores: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
 
 
 @dataclass
-class StochasticBeamSearchEncoderDecoderOutput(ModelOutput):
+class CustomScoreBeamSearchEncoderDecoderOutput(ModelOutput):
+    """
+    TODO
+    """
 
     sequences: torch.LongTensor = None
     sequences_scores: Optional[torch.FloatTensor] = None
-    sequences_gumbels: Optional[torch.FloatTensor] = None
+    sequences_custom_scores: Optional[torch.FloatTensor] = None
     scores: Optional[Tuple[torch.FloatTensor]] = None
-    gumbels: Optional[Tuple[torch.FloatTensor]] = None
+    custom_scores: Optional[Tuple[torch.FloatTensor]] = None
     encoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
     encoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     decoder_attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
@@ -413,7 +419,7 @@ GreedySearchOutput = Union[GreedySearchEncoderDecoderOutput, GreedySearchDecoder
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 BeamSearchOutput = Union[BeamSearchEncoderDecoderOutput, BeamSearchDecoderOnlyOutput]
 BeamSampleOutput = Union[BeamSampleEncoderDecoderOutput, BeamSampleDecoderOnlyOutput]
-StochasticBeamSearchOutput = Union[StochasticBeamSearchEncoderDecoderOutput, StochasticBeamSearchDecoderOnlyOutput]
+CustomScoreBeamSearchOutput = Union[CustomScoreBeamSearchEncoderDecoderOutput, CustomScoreBeamSearchDecoderOnlyOutput]
 
 
 class GenerationMixin:
@@ -730,6 +736,7 @@ class GenerationMixin:
         num_beam_groups: Optional[int] = None,
         diversity_penalty: Optional[float] = None,
         prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
+        top_hypothesis_factor: Optional[int] = 2,
         value_model = None,
         contribution_factor: Optional[float] = None,
         output_attentions: Optional[bool] = None,
@@ -752,7 +759,15 @@ class GenerationMixin:
         mcts_topk_actions: Optional[int] = None,
         mcts_value_model = None,
         **model_kwargs,
-    ) -> Union[GreedySearchOutput, SampleOutput, BeamSearchOutput, BeamSampleOutput, MCTSOutput, torch.LongTensor]:
+    ) -> Union[
+        GreedySearchOutput,
+        SampleOutput,
+        BeamSearchOutput,
+        BeamSampleOutput,
+        CustomScoreBeamSearchOutput,
+        MCTSOutput,
+        torch.LongTensor
+    ]:
         r"""
         Generates sequences for models with a language modeling head. The method currently supports greedy decoding,
         multinomial sampling, beam-search decoding, and beam-search multinomial sampling.
@@ -1247,7 +1262,9 @@ class GenerationMixin:
             )
 
         elif is_beam_value_gen_mode:
-            value_processor = ValueLogitsProcessor(value_model, contribution_factor)
+            value_processor = ValueLogitsProcessor(
+                num_beams, top_hypothesis_factor, value_model, contribution_factor
+            )
 
             batch_size = input_ids.shape[0]
 
@@ -2490,7 +2507,7 @@ class GenerationMixin:
         return_dict_in_generate: Optional[bool] = None,
         synced_gpus: Optional[bool] = None,
         **model_kwargs,
-    ) -> Union[StochasticBeamSearchOutput, torch.LongTensor]:
+    ) -> Union[CustomScoreBeamSearchOutput, torch.LongTensor]:
         # init values
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
         gumbel_logits_warper = GumbelLogitsWarper()
@@ -2666,12 +2683,12 @@ class GenerationMixin:
                 sequence_outputs["sequence_scores"] = None
                 sequence_outputs["sequence_custom_scores"] = None
             if self.config.is_encoder_decoder:
-                return StochasticBeamSearchEncoderDecoderOutput(
+                return CustomScoreBeamSearchEncoderDecoderOutput(
                     sequences=sequence_outputs["sequences"],
                     sequences_scores=sequence_outputs["sequence_scores"],
-                    sequences_gumbels=sequence_outputs["sequence_custom_scores"],
+                    sequences_custom_scores=sequence_outputs["sequence_custom_scores"],
                     scores=scores,
-                    gumbels=gumbels,
+                    custom_scores=gumbels,
                     encoder_attentions=encoder_attentions,
                     encoder_hidden_states=encoder_hidden_states,
                     decoder_attentions=decoder_attentions,
@@ -2679,12 +2696,12 @@ class GenerationMixin:
                     decoder_hidden_states=decoder_hidden_states,
                 )
             else:
-                return StochasticBeamSearchDecoderOnlyOutput(
+                return CustomScoreBeamSearchDecoderOnlyOutput(
                     sequences=sequence_outputs["sequences"],
                     sequences_scores=sequence_outputs["sequence_scores"],
-                    sequences_gumbels=sequence_outputs["sequence_custom_scores"],
+                    sequences_custom_scores=sequence_outputs["sequence_custom_scores"],
                     scores=scores,
-                    gumbels=gumbels,
+                    custom_scores=gumbels,
                     attentions=decoder_attentions,
                     hidden_states=decoder_hidden_states,
                 )
@@ -2707,7 +2724,7 @@ class GenerationMixin:
         return_dict_in_generate: Optional[bool] = None,
         synced_gpus: Optional[bool] = None,
         **model_kwargs,
-    ) -> Union[BeamSearchOutput, torch.LongTensor]:
+    ) -> Union[CustomScoreBeamSearchOutput, torch.LongTensor]:
         r"""
         """
         # init values
@@ -2734,6 +2751,7 @@ class GenerationMixin:
 
         # init attention / hidden states / scores tuples
         scores = () if (return_dict_in_generate and output_scores) else None
+        values = () if (return_dict_in_generate and output_scores) else None
         decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
         cross_attentions = () if (return_dict_in_generate and output_attentions) else None
         decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
@@ -2757,9 +2775,6 @@ class GenerationMixin:
         beam_scores = torch.zeros((batch_size, num_beams), dtype=torch.float, device=input_ids.device)
         beam_scores[:, 1:] = -1e9
         beam_scores = beam_scores.view((batch_size * num_beams,))
-        beam_values = torch.zeros((batch_size, num_beams), dtype=torch.float, device=input_ids.device)
-        beam_values[:, 1:] = -1e9
-        beam_values = beam_scores.view((batch_size * num_beams,))
 
         num_step = 0
         this_peer_finished = False  # used by synced_gpus only
@@ -2798,7 +2813,6 @@ class GenerationMixin:
             )  # (batch_size * num_beams, vocab_size)
 
             next_token_scores = logits_processor(input_ids, next_token_scores)
-            next_token_values = value_processor(input_ids, next_token_scores, beam_scores, num_step)
             next_token_scores = next_token_scores + beam_scores[:, None].expand_as(next_token_scores)
 
             # Store scores, attentions and hidden_states when required
@@ -2822,15 +2836,13 @@ class GenerationMixin:
             # reshape for beam search
             vocab_size = next_token_scores.shape[-1]
             next_token_scores = next_token_scores.view(batch_size, num_beams * vocab_size)
-            next_token_values = next_token_values.view(batch_size, num_beams * vocab_size)
-
-            next_token_values, next_tokens = torch.topk(
-                next_token_values, 2 * num_beams, dim=1, largest=True, sorted=True
+            next_token_values, next_token_scores, next_indices, next_tokens = value_processor(
+                input_ids, next_token_scores, vocab_size, num_step
             )
-            next_token_scores = next_token_scores.gather(dim=1, index=next_tokens)
 
-            next_indices = (next_tokens / vocab_size).long()
-            next_tokens = next_tokens % vocab_size
+            if return_dict_in_generate:
+                if output_scores:
+                    values += (next_token_values,)
 
             # stateless
             beam_outputs = beam_scorer.process(
@@ -2878,11 +2890,14 @@ class GenerationMixin:
         if return_dict_in_generate:
             if not output_scores:
                 sequence_outputs["sequence_scores"] = None
+                sequence_outputs["sequence_custom_scores"] = None
             if self.config.is_encoder_decoder:
-                return BeamSearchEncoderDecoderOutput(
+                return CustomScoreBeamSearchEncoderDecoderOutput(
                     sequences=sequence_outputs["sequences"],
                     sequences_scores=sequence_outputs["sequence_scores"],
+                    sequences_custom_scores=sequence_outputs["sequences_custom_scores"],
                     scores=scores,
+                    custom_scores=values,
                     encoder_attentions=encoder_attentions,
                     encoder_hidden_states=encoder_hidden_states,
                     decoder_attentions=decoder_attentions,
@@ -2890,10 +2905,12 @@ class GenerationMixin:
                     decoder_hidden_states=decoder_hidden_states,
                 )
             else:
-                return BeamSearchDecoderOnlyOutput(
+                return CustomScoreBeamSearchDecoderOnlyOutput(
                     sequences=sequence_outputs["sequences"],
                     sequences_scores=sequence_outputs["sequence_scores"],
+                    sequences_custom_scores=sequence_outputs["sequences_custom_scores"],
                     scores=scores,
+                    custom_scores=values,
                     attentions=decoder_attentions,
                     hidden_states=decoder_hidden_states,
                 )

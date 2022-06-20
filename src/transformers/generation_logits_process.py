@@ -16,7 +16,7 @@
 import inspect
 import math
 from abc import ABC
-from typing import Callable, Iterable, List
+from typing import Callable, Iterable, List, Tuple, Union
 
 import numpy as np
 import torch
@@ -624,7 +624,14 @@ class ValueLogitsProcessor(LogitsProcessor):
     TODO
     """
 
-    def __init__(self, value_model, contribution_factor):
+    def __init__(
+        self,
+        num_beams: int,
+        top_hypothesis_factor: int,
+        value_model,
+        contribution_factor: float,
+    ):
+        self.num_hypothesis = top_hypothesis_factor * num_beams
         self.value_model = value_model
         self.contribution_factor = contribution_factor
 
@@ -632,14 +639,33 @@ class ValueLogitsProcessor(LogitsProcessor):
         self,
         input_ids: torch.LongTensor,
         scores: torch.FloatTensor,
-        beam_scores: torch.FloatTensor,
+        vocab_size: int,
         num_step: int
-    ) -> torch.FloatTensor:
-        values = [
-            self.value_model.evaluate(node_id=input_ids[i].tolist(), likelihood=torch.exp(beam_scores[i]).item())
-            for i in range(input_ids.shape[0])
-        ]
-        values = torch.tensor(values)[:, None]
+    ) -> Tuple[Union[torch.LongTensor, torch.FloatTensor]]:
+        # Retrieve tokens with top log likelihood
+        scores, next_tokens = torch.topk(
+            scores, self.num_hypothesis, dim=1, largest=True, sorted=True
+        )
+        next_indices = (next_tokens / vocab_size).long()
+        next_tokens = next_tokens % vocab_size
+
+        # Compute value scores for retrieved tokens
+        values = torch.zeros_like(scores)
+        batch_size = scores.shape[0]
+        
+        for i in range(batch_size):
+            for j in range(self.num_hypothesis):
+                beam_id = i * next_indices[i, j]
+                node_id = torch.cat([input_ids[beam_id], next_tokens[i, j].unsqueeze(-1)]).tolist()
+                likelihood = np.exp(scores[i, j].item())
+                values[i, j] = self.value_model.evaluate(node_id=node_id, likelihood=likelihood)
+
         value_scores = self.contribution_factor / num_step * scores + (1 - self.contribution_factor) * values
 
-        return value_scores
+        # Sort returns by value scores
+        value_scores, value_score_ids = value_scores.sort(dim=1, descending=True)
+        scores = scores.gather(dim=1, index=value_score_ids)
+        next_indices = next_indices.gather(dim=1, index=value_score_ids)
+        next_tokens = next_tokens.gather(dim=1, index=value_score_ids)
+
+        return value_scores, scores, next_indices, next_tokens
