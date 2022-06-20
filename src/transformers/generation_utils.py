@@ -1315,7 +1315,7 @@ class GenerationMixin:
 
             # TODO Do all models have max_position_embeddings?
             #  How to determine the maximum input length of the model?
-            max_depth = self.config.max_position_embeddings
+            max_depth = self.config.max_position_embeddings - input_ids.shape[-1]
 
             def run_policy(root: mctx_base.RootFnOutput):
                 return mctx.muzero_policy_for_action_sequence(
