@@ -391,8 +391,9 @@ class BeamHypotheses:
             return ret
 
 
-class StochasticBeamSearchScorer(BeamScorer):
+class CustomBeamSearchScorer(BeamScorer):
     r"""
+    TODO
     :class:`transformers.BeamScorer` implementing standard beam search decoding.
 
     Adapted in part from `Facebook's XLM beam search code
@@ -446,7 +447,7 @@ class StochasticBeamSearchScorer(BeamScorer):
 
         self._is_init = False
         self._beam_hyps = [
-            StochasticBeamHypotheses(
+            CustomScoreBeamHypotheses(
                 num_beams=self.num_beams,
                 length_penalty=self.length_penalty,
                 early_stopping=self.do_early_stopping,
@@ -483,7 +484,7 @@ class StochasticBeamSearchScorer(BeamScorer):
         next_scores: torch.FloatTensor,
         next_tokens: torch.LongTensor,
         next_indices: torch.LongTensor,
-        next_gumbels: torch.LongTensor,
+        next_custom_scores: torch.LongTensor,
         pad_token_id: Optional[int] = None,
         eos_token_id: Optional[int] = None,
     ) -> Tuple[torch.Tensor]:
@@ -495,7 +496,7 @@ class StochasticBeamSearchScorer(BeamScorer):
         next_beam_scores = torch.zeros((batch_size, self.group_size), dtype=next_scores.dtype, device=device)
         next_beam_tokens = torch.zeros((batch_size, self.group_size), dtype=next_tokens.dtype, device=device)
         next_beam_indices = torch.zeros((batch_size, self.group_size), dtype=next_indices.dtype, device=device)
-        next_beam_gumbels = torch.zeros((batch_size, self.group_size), dtype=next_gumbels.dtype, device=device)
+        next_beam_custom_scores = torch.zeros((batch_size, self.group_size), dtype=next_custom_scores.dtype, device=device)
 
         for batch_idx, beam_hyp in enumerate(self._beam_hyps):
             if self._done[batch_idx]:
@@ -509,13 +510,13 @@ class StochasticBeamSearchScorer(BeamScorer):
                 next_beam_scores[batch_idx, :] = 0
                 next_beam_tokens[batch_idx, :] = pad_token_id
                 next_beam_indices[batch_idx, :] = 0
-                next_beam_gumbels[batch_idx, :] = 0
+                next_beam_custom_scores[batch_idx, :] = 0
                 continue
 
             # next tokens for this sentence
             beam_idx = 0
-            for beam_token_rank, (next_token, next_score, next_index, next_gumbel) in enumerate(
-                zip(next_tokens[batch_idx], next_scores[batch_idx], next_indices[batch_idx], next_gumbels[batch_idx])
+            for beam_token_rank, (next_token, next_score, next_index, next_custom_score) in enumerate(
+                zip(next_tokens[batch_idx], next_scores[batch_idx], next_indices[batch_idx], next_custom_scores[batch_idx])
             ):
                 batch_beam_idx = batch_idx * self.group_size + next_index
                 # add to generated hypotheses if end of sentence
@@ -527,14 +528,14 @@ class StochasticBeamSearchScorer(BeamScorer):
                     beam_hyp.add(
                         input_ids[batch_beam_idx].clone(),
                         next_score.item(),
-                        next_gumbel.item()
+                        next_custom_score.item()
                     )
                 else:
                     # add next predicted token since it is not eos_token
                     next_beam_scores[batch_idx, beam_idx] = next_score
                     next_beam_tokens[batch_idx, beam_idx] = next_token
                     next_beam_indices[batch_idx, beam_idx] = batch_beam_idx
-                    next_beam_gumbels[batch_idx, beam_idx] = next_gumbel
+                    next_beam_custom_scores[batch_idx, beam_idx] = next_custom_score
                     beam_idx += 1
 
                 # once the beam for next step is full, don't add more tokens to it.
@@ -548,7 +549,7 @@ class StochasticBeamSearchScorer(BeamScorer):
 
             # Check if we are done so that we can save a pad step if all(done)
             self._done[batch_idx] = self._done[batch_idx] or beam_hyp.is_done(
-                next_gumbels[batch_idx].max().item(), cur_len
+                next_custom_scores[batch_idx].max().item(), cur_len
             )
 
         return UserDict(
@@ -556,7 +557,7 @@ class StochasticBeamSearchScorer(BeamScorer):
                 "next_beam_scores": next_beam_scores.view(-1),
                 "next_beam_tokens": next_beam_tokens.view(-1),
                 "next_beam_indices": next_beam_indices.view(-1),
-                "next_beam_gumbels": next_beam_gumbels.view(-1),
+                "next_beam_custom_scores": next_beam_custom_scores.view(-1),
             }
         )
 
@@ -566,7 +567,7 @@ class StochasticBeamSearchScorer(BeamScorer):
         final_beam_scores: torch.FloatTensor,
         final_beam_tokens: torch.LongTensor,
         final_beam_indices: torch.LongTensor,
-        final_beam_gumbels: torch.LongTensor,
+        final_beam_custom_scores: torch.LongTensor,
         max_length: int,
         pad_token_id: Optional[int] = None,
         eos_token_id: Optional[int] = None,
@@ -583,31 +584,31 @@ class StochasticBeamSearchScorer(BeamScorer):
             for beam_id in range(self.num_beams):
                 batch_beam_idx = batch_idx * self.num_beams + beam_id
                 final_score = final_beam_scores[batch_beam_idx].item()
-                final_gumbel = final_beam_gumbels[batch_beam_idx].item()
+                final_custom_score = final_beam_custom_scores[batch_beam_idx].item()
                 final_tokens = input_ids[batch_beam_idx]
-                beam_hyp.add(final_tokens, final_score, final_gumbel)
+                beam_hyp.add(final_tokens, final_score, final_custom_score)
 
         # select the best hypotheses
         sent_lengths = input_ids.new(batch_size * self.num_beam_hyps_to_keep)
         best = []
         best_scores = torch.zeros(batch_size * self.num_beam_hyps_to_keep, device=self.device, dtype=torch.float32)
-        best_gumbels = torch.zeros(batch_size * self.num_beam_hyps_to_keep, device=self.device, dtype=torch.float32)
+        best_custom_scores = torch.zeros(batch_size * self.num_beam_hyps_to_keep, device=self.device, dtype=torch.float32)
 
         # retrieve best hypotheses
         for i, beam_hyp in enumerate(self._beam_hyps):
-            # Gumbel top hypotheses
+            # Custom score top hypotheses
             sorted_hyps = sorted(beam_hyp.beams, key=lambda x: x[0])[-self.num_beam_hyps_to_keep:]
             # sort by unperturbed score
             sorted_hyps = sorted(sorted_hyps, key=lambda x: x[1])
             for j in range(self.num_beam_hyps_to_keep):
                 best_hyp_tuple = sorted_hyps.pop()
-                best_gumbel, best_score, best_hyp = best_hyp_tuple
+                best_custom_score, best_score, best_hyp = best_hyp_tuple
                 sent_lengths[self.num_beam_hyps_to_keep * i + j] = len(best_hyp)
 
                 # append to lists
                 best.append(best_hyp)
                 best_scores[i * self.num_beam_hyps_to_keep + j] = best_score
-                best_gumbels[i * self.num_beam_hyps_to_keep + j] = best_gumbel
+                best_custom_scores[i * self.num_beam_hyps_to_keep + j] = best_custom_score
 
         # prepare for adding eos
         sent_max_len = min(sent_lengths.max().item() + 1, max_length)
@@ -626,31 +627,31 @@ class StochasticBeamSearchScorer(BeamScorer):
             {
                 "sequences": decoded,
                 "sequence_scores": best_scores,
-                "sequence_gumbels": best_gumbels,
+                "sequence_custom_scores": best_custom_scores,
             }
         )
 
 
-class StochasticBeamHypotheses(BeamHypotheses):
+class CustomScoreBeamHypotheses(BeamHypotheses):
     def __init__(self, num_beams: int, length_penalty: float, early_stopping: bool):
         super().__init__(num_beams, length_penalty, early_stopping)
 
-    def add(self, hyp: torch.LongTensor, sum_logprobs: float, gumbel: float):
+    def add(self, hyp: torch.LongTensor, sum_logprobs: float, custom_score: float):
         """
         Add a new hypothesis to the list.
         """
         score = sum_logprobs / (hyp.shape[-1] ** self.length_penalty)
-        gumbel_score = gumbel / (hyp.shape[-1] ** self.length_penalty)
-        if len(self) < self.num_beams or gumbel_score > self.worst_score:
-            self.beams.append((gumbel_score, score, hyp))
+        custom_score = custom_score / (hyp.shape[-1] ** self.length_penalty)
+        if len(self) < self.num_beams or custom_score > self.worst_score:
+            self.beams.append((custom_score, score, hyp))
             if len(self) > self.num_beams:
                 sorted_next_scores = sorted([(s, idx) for idx, (s, _, _) in enumerate(self.beams)])
                 del self.beams[sorted_next_scores[0][1]]
                 self.worst_score = sorted_next_scores[1][0]
             else:
-                self.worst_score = min(gumbel_score, self.worst_score)
+                self.worst_score = min(custom_score, self.worst_score)
 
-    def is_done(self, best_gumbel: float, cur_len: int) -> bool:
+    def is_done(self, best_custom_score: float, cur_len: int) -> bool:
         """
         If there are enough hypotheses and that none of the hypotheses being generated can become better than the worst
         one in the heap, then we are done with this sentence.
@@ -661,6 +662,6 @@ class StochasticBeamHypotheses(BeamHypotheses):
         elif self.early_stopping:
             return True
         else:
-            cur_score = best_gumbel / cur_len ** self.length_penalty
+            cur_score = best_custom_score / cur_len ** self.length_penalty
             ret = self.worst_score >= cur_score
             return ret
