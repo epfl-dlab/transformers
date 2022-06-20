@@ -482,7 +482,7 @@ if is_torch_available():
         "TextDataset",
         "TextDatasetForNextSentencePrediction",
     ]
-    _import_structure["generation_beam_search"] = ["BeamScorer", "BeamSearchScorer", "StochasticBeamSearchScorer"]
+    _import_structure["generation_beam_search"] = ["BeamScorer", "BeamSearchScorer", "CustomBeamSearchScorer"]
     _import_structure["generation_logits_process"] = [
         "ForcedBOSTokenLogitsProcessor",
         "ForcedEOSTokenLogitsProcessor",
@@ -500,6 +500,7 @@ if is_torch_available():
         "TopKLogitsWarper",
         "TopPLogitsWarper",
         "GumbelLogitsWarper",
+        "ValueLogitsProcessor",
     ]
     _import_structure["generation_stopping_criteria"] = [
         "MaxLengthCriteria",
@@ -2197,7 +2198,7 @@ if TYPE_CHECKING:
             TextDataset,
             TextDatasetForNextSentencePrediction,
         )
-        from .generation_beam_search import BeamScorer, BeamSearchScorer, StochasticBeamSearchScorer
+        from .generation_beam_search import BeamScorer, BeamSearchScorer, CustomBeamSearchScorer
         from .generation_logits_process import (
             ForcedBOSTokenLogitsProcessor,
             ForcedEOSTokenLogitsProcessor,
@@ -2215,6 +2216,7 @@ if TYPE_CHECKING:
             TopKLogitsWarper,
             TopPLogitsWarper,
             GumbelLogitsWarper,
+            ValueLogitsProcessor,
         )
         from .generation_stopping_criteria import (
             MaxLengthCriteria,

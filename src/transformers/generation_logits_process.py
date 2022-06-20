@@ -617,3 +617,29 @@ class GumbelLogitsWarper(LogitsWarper):
             -torch.exp(gumbel_scores - max_children.unsqueeze(-1))
         )
         return maximums.unsqueeze(-1) - torch.nn.functional.relu(u) - torch.log1p(torch.exp(-u.abs()))
+
+
+class ValueLogitsProcessor(LogitsProcessor):
+    r"""
+    TODO
+    """
+
+    def __init__(self, value_model, contribution_factor):
+        self.value_model = value_model
+        self.contribution_factor = contribution_factor
+
+    def __call__(
+        self,
+        input_ids: torch.LongTensor,
+        scores: torch.FloatTensor,
+        beam_scores: torch.FloatTensor,
+        num_step: int
+    ) -> torch.FloatTensor:
+        values = [
+            self.value_model.evaluate(node_id=input_ids[i].tolist(), likelihood=torch.exp(beam_scores[i]).item())
+            for i in range(input_ids.shape[0])
+        ]
+        values = torch.tensor(values)[:, None]
+        value_scores = self.contribution_factor / num_step * scores + (1 - self.contribution_factor) * values
+
+        return value_scores
