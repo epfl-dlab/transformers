@@ -631,6 +631,7 @@ class ValueLogitsProcessor(LogitsProcessor):
         value_model,
         contribution_factor: float,
     ):
+        self.num_beams = num_beams
         self.num_hypothesis = top_hypothesis_factor * num_beams
         self.value_model = value_model
         self.contribution_factor = contribution_factor
@@ -655,7 +656,7 @@ class ValueLogitsProcessor(LogitsProcessor):
         
         for i in range(batch_size):
             for j in range(self.num_hypothesis):
-                beam_id = i * next_indices[i, j]
+                beam_id = i * self.num_beams + next_indices[i, j]
                 node_id = torch.cat([input_ids[beam_id], next_tokens[i, j].unsqueeze(-1)]).tolist()
                 likelihood = np.exp(scores[i, j].item())
                 values[i, j] = self.value_model.evaluate(node_id=node_id, likelihood=likelihood)
