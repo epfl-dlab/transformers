@@ -715,6 +715,7 @@ class GenerationMixin:
         min_length: Optional[int] = None,
         do_sample: Optional[bool] = None,
         do_stochastic: Optional[bool] = None,
+        do_value_guided: Optional[bool] = None,
         early_stopping: Optional[bool] = None,
         num_beams: Optional[int] = None,
         temperature: Optional[float] = None,
@@ -738,7 +739,7 @@ class GenerationMixin:
         prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
         top_hypothesis_factor: Optional[int] = 2,
         value_model = None,
-        contribution_factor: Optional[float] = None,
+        contribution_factor: Optional[float] = 0.5,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_scores: Optional[bool] = None,
@@ -1053,13 +1054,16 @@ class GenerationMixin:
                         "Found do_sample: {0}, do_stochastic: {1}".format(do_sample, do_stochastic)
                     )
                 )
-            if not do_sample and not do_stochastic:
-                is_beam_gen_mode = (num_beams > 1) and (num_beam_groups == 1) and value_model is None
-                is_beam_value_gen_mode = (num_beams > 1) and (num_beam_groups == 1) and value_model is not None
+            if not do_sample and not do_stochastic and not do_value_guided:
+                is_beam_gen_mode = (num_beams > 1) and (num_beam_groups == 1)
             elif do_sample:
                 is_beam_sample_gen_mode = (num_beams > 1) and (num_beam_groups == 1)
             elif do_stochastic:
                 is_beam_stochastic_gen_mode = (num_beams > 1) and (num_beam_groups == 1)
+            elif do_value_guided:
+                is_beam_value_gen_mode = (num_beams > 1) and (num_beam_groups == 1)
+                if value_model is None:
+                    raise ValueError("No `value_model` found for value guided beam search.")
             is_group_beam_gen_mode = (num_beams > 1) and (num_beam_groups > 1)
             if num_beam_groups > num_beams:
                 raise ValueError("`num_beam_groups` has to be smaller or equal to `num_beams`")
@@ -2895,7 +2899,7 @@ class GenerationMixin:
                 return CustomScoreBeamSearchEncoderDecoderOutput(
                     sequences=sequence_outputs["sequences"],
                     sequences_scores=sequence_outputs["sequence_scores"],
-                    sequences_custom_scores=sequence_outputs["sequences_custom_scores"],
+                    sequences_custom_scores=sequence_outputs["sequence_custom_scores"],
                     scores=scores,
                     custom_scores=values,
                     encoder_attentions=encoder_attentions,
@@ -2908,7 +2912,7 @@ class GenerationMixin:
                 return CustomScoreBeamSearchDecoderOnlyOutput(
                     sequences=sequence_outputs["sequences"],
                     sequences_scores=sequence_outputs["sequence_scores"],
-                    sequences_custom_scores=sequence_outputs["sequences_custom_scores"],
+                    sequences_custom_scores=sequence_outputs["sequence_custom_scores"],
                     scores=scores,
                     custom_scores=values,
                     attentions=decoder_attentions,
