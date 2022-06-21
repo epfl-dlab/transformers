@@ -1313,11 +1313,7 @@ class GenerationMixin:
             if stopping_criteria.max_length is None:
                 raise ValueError("`max_length` needs to be a stopping_criteria for now.")
 
-            # TODO Do all models have max_position_embeddings?
-            #  How to determine the maximum input length of the model?
-            max_depth = self.config.max_position_embeddings - input_ids.shape[-1]
-
-            def run_policy(root: mctx_base.RootFnOutput):
+            def run_policy(root: mctx_base.RootFnOutput, max_depth):
                 return mctx.muzero_policy_for_action_sequence(
                     params=(),
                     rng_key=jax.random.PRNGKey(0),
@@ -1335,6 +1331,10 @@ class GenerationMixin:
                     invalid_actions=None,
                     temperature=temperature if temperature is not None else 1.0,
                 )
+
+            # TODO Do all models have max_position_embeddings?
+            #  How to otherwise determine the maximum input length of the model?
+            max_depth = self.config.max_position_embeddings - input_ids.shape[-1]
 
             root = self.mcts_root_fn(
                 input_ids=input_ids,
@@ -1357,7 +1357,7 @@ class GenerationMixin:
                 jitted_run_policy = self.__mcts_jit_cache
             else:
                 jitted_run_policy = jax.jit(run_policy)
-            policy_output = jitted_run_policy(root)
+            policy_output = jitted_run_policy(root, max_depth)
 
             # TODO not all actions might be used from the policy_output if early stopping was used
             return self.mcts_finalize(policy_output=policy_output)
