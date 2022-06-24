@@ -737,8 +737,9 @@ class GenerationMixin:
         num_beam_groups: Optional[int] = None,
         diversity_penalty: Optional[float] = None,
         prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
-        top_hypothesis_factor: Optional[int] = 2,
+        tokens_considered_by_value_processor: int = None,
         value_model = None,
+        value_model_kwargs = None,
         contribution_factor: Optional[float] = 0.5,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -1054,6 +1055,21 @@ class GenerationMixin:
                         "Found do_sample: {0}, do_stochastic: {1}".format(do_sample, do_stochastic)
                     )
                 )
+            if do_sample and do_value_guided:
+                raise ValueError(
+                    (
+                        "Only one of do_sample and do_stochastic can be specified. "
+                        "Found do_sample: {0}, do_stochastic: {1}".format(do_sample, do_value_guided)
+                    )
+                )
+            if do_stochastic and do_value_guided:
+                raise ValueError(
+                    (
+                        "Only one of do_sample and do_stochastic can be specified. "
+                        "Found do_sample: {0}, do_stochastic: {1}".format(do_stochastic, do_value_guided)
+                    )
+                )
+
             if not do_sample and not do_stochastic and not do_value_guided:
                 is_beam_gen_mode = (num_beams > 1) and (num_beam_groups == 1)
             elif do_sample:
@@ -1064,6 +1080,9 @@ class GenerationMixin:
                 is_beam_value_gen_mode = (num_beams > 1) and (num_beam_groups == 1)
                 if value_model is None:
                     raise ValueError("No `value_model` found for value guided beam search.")
+                if tokens_considered_by_value_processor is None:
+                    raise ValueError("`tokens_considered_by_value_processor` must be set for value guided beam search.")
+
             is_group_beam_gen_mode = (num_beams > 1) and (num_beam_groups > 1)
             if num_beam_groups > num_beams:
                 raise ValueError("`num_beam_groups` has to be smaller or equal to `num_beams`")
@@ -1267,7 +1286,7 @@ class GenerationMixin:
 
         elif is_beam_value_gen_mode:
             value_processor = ValueLogitsProcessor(
-                num_beams, top_hypothesis_factor, value_model, contribution_factor
+                num_beams, tokens_considered_by_value_processor, value_model, contribution_factor
             )
 
             batch_size = input_ids.shape[0]
@@ -1281,6 +1300,9 @@ class GenerationMixin:
             if stopping_criteria.max_length is None:
                 raise ValueError("`max_length` needs to be a stopping_criteria for now.")
 
+            if tokens_considered_by_value_processor < 2 * num_beams:
+                raise ValueError("`tokens_considered_by_value_processor` has to be larger or equal to `2 * num_beams`.")
+
             beam_scorer = CustomBeamSearchScorer(
                 batch_size=batch_size,
                 num_beams=num_beams,
@@ -1289,10 +1311,18 @@ class GenerationMixin:
                 do_early_stopping=early_stopping,
                 num_beam_hyps_to_keep=num_return_sequences,
             )
+
+            if value_model_kwargs is not None and "target_ids" in value_model_kwargs:
+                expanded_return_idx = (
+                    torch.arange(input_ids.shape[0]).view(-1, 1).repeat(1, num_beams).view(-1).to(input_ids.device)
+                )
+                value_model_kwargs["target_ids"] = value_model_kwargs["target_ids"].index_select(0, expanded_return_idx)
+
             # interleave with `num_beams`
             input_ids, model_kwargs = self._expand_inputs_for_generation(
                 input_ids, expand_size=num_beams, is_encoder_decoder=self.config.is_encoder_decoder, **model_kwargs
             )
+
             return self.value_guided_beam_search(
                 input_ids,
                 beam_scorer,
@@ -1304,6 +1334,7 @@ class GenerationMixin:
                 output_scores=output_scores,
                 return_dict_in_generate=return_dict_in_generate,
                 synced_gpus=synced_gpus,
+                value_model_kwargs=value_model_kwargs,
                 **model_kwargs,
             )
 
@@ -2727,6 +2758,7 @@ class GenerationMixin:
         output_scores: Optional[bool] = None,
         return_dict_in_generate: Optional[bool] = None,
         synced_gpus: Optional[bool] = None,
+        value_model_kwargs: dict = None,
         **model_kwargs,
     ) -> Union[CustomScoreBeamSearchOutput, torch.LongTensor]:
         r"""
@@ -2837,16 +2869,20 @@ class GenerationMixin:
                         else (outputs.hidden_states,)
                     )
 
-            # reshape for beam search
+            # # reshape for beam search
             vocab_size = next_token_scores.shape[-1]
-            next_token_scores = next_token_scores.view(batch_size, num_beams * vocab_size)
-            next_token_values, next_token_scores, next_indices, next_tokens = value_processor(
-                input_ids, next_token_scores, vocab_size, num_step
+            # next_token_scores = next_token_scores.view(batch_size, num_beams * vocab_size)
+            next_token_value_incorporated_scores, next_token_scores, next_indices, next_tokens = value_processor(
+                input_ids, next_token_scores, vocab_size, num_step, **value_model_kwargs
             )
 
             if return_dict_in_generate:
                 if output_scores:
-                    values += (next_token_values,)
+                    values += (next_token_value_incorporated_scores,)
+
+            # Todo: Verify that the beam processing and finalization is working as intended
+            # Verify that the final beams are chosen according to the value_incorporated_scores
+            # and that they are not further normalized
 
             # stateless
             beam_outputs = beam_scorer.process(
@@ -2854,14 +2890,14 @@ class GenerationMixin:
                 next_token_scores,
                 next_tokens,
                 next_indices,
-                next_token_values,
+                next_token_value_incorporated_scores,
                 pad_token_id=pad_token_id,
                 eos_token_id=eos_token_id,
             )
-            beam_scores = beam_outputs["next_beam_scores"]
+            beam_scores = beam_outputs["next_beam_scores"]  # verify that this is the standard score
             beam_next_tokens = beam_outputs["next_beam_tokens"]
             beam_idx = beam_outputs["next_beam_indices"]
-            beam_values = beam_outputs["next_beam_custom_scores"]
+            beam_values = beam_outputs["next_beam_custom_scores"]  # verify that this is the value_incorporated_score
 
             input_ids = torch.cat([input_ids[beam_idx, :], beam_next_tokens.unsqueeze(-1)], dim=-1)
 

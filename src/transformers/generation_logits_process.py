@@ -627,46 +627,69 @@ class ValueLogitsProcessor(LogitsProcessor):
     def __init__(
         self,
         num_beams: int,
-        top_hypothesis_factor: int,
+        # top_hypothesis_factor: int,
+        num_tokens_considered_by_value_processor: int,
         value_model,
         contribution_factor: float,
+        eps=10e-8
     ):
         self.num_beams = num_beams
-        self.num_hypothesis = top_hypothesis_factor * num_beams
+        # self.num_hypothesis = top_hypothesis_factor * num_beams
+        self.num_tokens_per_beam = num_tokens_considered_by_value_processor
         self.value_model = value_model
-        self.contribution_factor = contribution_factor
+        self.contribution_factor = contribution_factor + eps
 
     def __call__(
         self,
         input_ids: torch.LongTensor,
-        scores: torch.FloatTensor,
+        next_token_scores: torch.FloatTensor,
         vocab_size: int,
-        num_step: int
+        num_step: int,
+        **kwargs
     ) -> Tuple[Union[torch.LongTensor, torch.FloatTensor]]:
-        # Retrieve tokens with top log likelihood
-        scores, next_tokens = torch.topk(
-            scores, self.num_hypothesis, dim=1, largest=True, sorted=True
+        # Retrieve the num_tokens_per_beam tokens with top scores
+        scores, next_preliminary_tokens = torch.topk(
+            next_token_scores, self.num_tokens_per_beam, dim=1, largest=True, sorted=True
         )
-        next_indices = (next_tokens / vocab_size).long()
-        next_tokens = next_tokens % vocab_size
 
-        # Compute value scores for retrieved tokens
-        values = torch.zeros_like(scores)
-        batch_size = scores.shape[0]
-        
-        for i in range(batch_size):
-            for j in range(self.num_hypothesis):
-                beam_id = i * self.num_beams + next_indices[i, j]
-                node_id = torch.cat([input_ids[beam_id], next_tokens[i, j].unsqueeze(-1)]).tolist()
-                likelihood = np.exp(scores[i, j].item())
-                values[i, j] = self.value_model.evaluate(node_id=node_id, likelihood=likelihood)
+        values = self.value_model.evaluate(input_ids=input_ids,
+                                           next_token_ids=next_preliminary_tokens,
+                                           **kwargs)
 
-        value_scores = self.contribution_factor / num_step * scores + (1 - self.contribution_factor) * values
+        # next_indices = (next_tokens / vocab_size).long()
+        # next_tokens = next_tokens % vocab_size
 
-        # Sort returns by value scores
-        value_scores, value_score_ids = value_scores.sort(dim=1, descending=True)
-        scores = scores.gather(dim=1, index=value_score_ids)
-        next_indices = next_indices.gather(dim=1, index=value_score_ids)
-        next_tokens = next_tokens.gather(dim=1, index=value_score_ids)
+        # # Compute value scores for retrieved tokens
+        # values = torch.zeros_like(scores)
+        # batch_size = scores.shape[0]
+        #
+        # for i in range(batch_size):
+        #     for j in range(self.num_hypothesis):
+        #         beam_id = i * self.num_beams + next_indices[i, j]
+        #         node_id = torch.cat([input_ids[beam_id], next_tokens[i, j].unsqueeze(-1)]).tolist()
+        #         likelihood = np.exp(scores[i, j].item())
+        #         values[i, j] = self.value_model.evaluate(node_id=node_id, likelihood=likelihood)
 
-        return value_scores, scores, next_indices, next_tokens
+        # # Sort returns by value scores
+        # value_scores, value_score_ids = value_scores.sort(dim=1, descending=True)
+        # scores = scores.gather(dim=1, index=value_score_ids)
+        # next_indices = next_indices.gather(dim=1, index=value_score_ids)
+        # next_tokens = next_tokens.gather(dim=1, index=value_score_ids)
+
+        # Todo: Apply length normalization on scores. self.contribution_factor / num_step ** length_penalty?
+        value_incorporated_scores = self.contribution_factor * scores + (1 - self.contribution_factor) * values
+
+        # Choose next indices and next tokens according to value_incorporated_scores
+        value_incorporated_scores = value_incorporated_scores.view(-1, self.num_beams * self.num_tokens_per_beam)
+
+        next_token_value_incorporated_scores, next_tokens_indices = torch.topk(
+            value_incorporated_scores, 2 * self.num_beams, dim=1, largest=True, sorted=True
+        )
+        # Todo: Double check that indexing is done correctly
+        next_token_scores = scores.view(-1, self.num_beams * self.num_tokens_per_beam)\
+            .gather(dim=1, index=next_tokens_indices)
+        next_indices = (next_tokens_indices / self.num_tokens_per_beam).long()
+        next_tokens = next_preliminary_tokens.view(-1, self.num_beams * self.num_tokens_per_beam)\
+            .gather(dim=1, index=next_tokens_indices)
+
+        return next_token_value_incorporated_scores, next_token_scores, next_indices, next_tokens
