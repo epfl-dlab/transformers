@@ -393,6 +393,7 @@ class CustomScoreBeamSearchDecoderOnlyOutput(ModelOutput):
     sequences_custom_scores: Optional[torch.FloatTensor] = None
     scores: Optional[Tuple[torch.FloatTensor]] = None
     custom_scores: Optional[Tuple[torch.FloatTensor]] = None
+    next_tokens_per_step: Optional[Tuple[torch.LongTensor]] = None
     attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
 
@@ -408,6 +409,7 @@ class CustomScoreBeamSearchEncoderDecoderOutput(ModelOutput):
     sequences_custom_scores: Optional[torch.FloatTensor] = None
     scores: Optional[Tuple[torch.FloatTensor]] = None
     custom_scores: Optional[Tuple[torch.FloatTensor]] = None
+    next_tokens_per_step: Optional[Tuple[torch.LongTensor]] = None
     encoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
     encoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     decoder_attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
@@ -1076,8 +1078,14 @@ class GenerationMixin:
                 is_beam_sample_gen_mode = (num_beams > 1) and (num_beam_groups == 1)
             elif do_stochastic:
                 is_beam_stochastic_gen_mode = (num_beams > 1) and (num_beam_groups == 1)
+                beam_scorer_apply_length_penalty_to_custom_scores = True  # the beam scorer will apply the length norm.
+                beam_scorer_sort_output_hyps_according_to_custom_scores = False  # the beam scorer will sort the output according to the custom scores
             elif do_value_guided:
                 is_beam_value_gen_mode = (num_beams > 1) and (num_beam_groups == 1)
+                beam_scorer_apply_length_penalty_to_custom_scores = False  # the beam scorer will apply the length norm.
+                beam_scorer_sort_output_hyps_according_to_custom_scores = True  # the beam scorer will sort the output according to the custom scores
+                if not is_beam_value_gen_mode:
+                    raise ValueError("`num_beams` needs to be larger than 1 for VGBS.")
                 if value_model is None:
                     raise ValueError("No `value_model` found for value guided beam search.")
                 if tokens_considered_by_value_processor is None:
@@ -1263,6 +1271,8 @@ class GenerationMixin:
                 num_beams=num_beams,
                 device=self.device,
                 length_penalty=length_penalty,
+                apply_length_penalty_to_custom_scores=beam_scorer_apply_length_penalty_to_custom_scores,
+                sort_output_hyps_according_to_custom_scores=beam_scorer_sort_output_hyps_according_to_custom_scores,
                 do_early_stopping=early_stopping,
                 num_beam_hyps_to_keep=num_return_sequences,
             )
@@ -1285,14 +1295,18 @@ class GenerationMixin:
             )
 
         elif is_beam_value_gen_mode:
+            length_penalty = length_penalty if length_penalty is not None else self.config.length_penalty
+            early_stopping = early_stopping if early_stopping is not None else self.config.early_stopping
+
             value_processor = ValueLogitsProcessor(
-                num_beams, tokens_considered_by_value_processor, value_model, contribution_factor
+                num_beams=num_beams,
+                num_tokens_considered_by_value_processor=tokens_considered_by_value_processor,
+                value_model=value_model,
+                contribution_factor=contribution_factor,
+                length_penalty=length_penalty
             )
 
             batch_size = input_ids.shape[0]
-
-            length_penalty = length_penalty if length_penalty is not None else self.config.length_penalty
-            early_stopping = early_stopping if early_stopping is not None else self.config.early_stopping
 
             if num_return_sequences > num_beams:
                 raise ValueError("`num_return_sequences` has to be smaller or equal to `num_beams`.")
@@ -1308,6 +1322,8 @@ class GenerationMixin:
                 num_beams=num_beams,
                 device=self.device,
                 length_penalty=length_penalty,
+                apply_length_penalty_to_custom_scores=beam_scorer_apply_length_penalty_to_custom_scores,
+                sort_output_hyps_according_to_custom_scores=beam_scorer_sort_output_hyps_according_to_custom_scores,
                 do_early_stopping=early_stopping,
                 num_beam_hyps_to_keep=num_return_sequences,
             )
@@ -2788,6 +2804,7 @@ class GenerationMixin:
         # init attention / hidden states / scores tuples
         scores = () if (return_dict_in_generate and output_scores) else None
         values = () if (return_dict_in_generate and output_scores) else None
+        next_tokens_per_step = () if (return_dict_in_generate and output_scores) else None
         decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
         cross_attentions = () if (return_dict_in_generate and output_attentions) else None
         decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
@@ -2878,11 +2895,8 @@ class GenerationMixin:
 
             if return_dict_in_generate:
                 if output_scores:
-                    values += (next_token_value_incorporated_scores,)
-
-            # Todo: Verify that the beam processing and finalization is working as intended
-            # Verify that the final beams are chosen according to the value_incorporated_scores
-            # and that they are not further normalized
+                    values += (next_token_value_incorporated_scores, )
+                    next_tokens_per_step += (next_tokens, )
 
             # stateless
             beam_outputs = beam_scorer.process(
@@ -2938,6 +2952,7 @@ class GenerationMixin:
                     sequences_custom_scores=sequence_outputs["sequence_custom_scores"],
                     scores=scores,
                     custom_scores=values,
+                    next_tokens_per_step=next_tokens_per_step,
                     encoder_attentions=encoder_attentions,
                     encoder_hidden_states=encoder_hidden_states,
                     decoder_attentions=decoder_attentions,
@@ -2951,6 +2966,7 @@ class GenerationMixin:
                     sequences_custom_scores=sequence_outputs["sequence_custom_scores"],
                     scores=scores,
                     custom_scores=values,
+                    next_tokens_per_step=next_tokens_per_step,
                     attentions=decoder_attentions,
                     hidden_states=decoder_hidden_states,
                 )

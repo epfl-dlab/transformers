@@ -431,6 +431,8 @@ class CustomBeamSearchScorer(BeamScorer):
         batch_size: int,
         num_beams: int,
         device: torch.device,
+        apply_length_penalty_to_custom_scores: bool,
+        sort_output_hyps_according_to_custom_scores: bool,
         length_penalty: Optional[float] = 1.0,
         do_early_stopping: Optional[bool] = False,
         num_beam_hyps_to_keep: Optional[int] = 1,
@@ -439,6 +441,8 @@ class CustomBeamSearchScorer(BeamScorer):
     ):
         self.num_beams = num_beams
         self.device = device
+        self.apply_length_penalty_to_custom_scores = apply_length_penalty_to_custom_scores
+        self.sort_output_hyps_according_to_custom_scores = sort_output_hyps_according_to_custom_scores
         self.length_penalty = length_penalty
         self.do_early_stopping = do_early_stopping
         self.num_beam_hyps_to_keep = num_beam_hyps_to_keep
@@ -450,6 +454,7 @@ class CustomBeamSearchScorer(BeamScorer):
             CustomScoreBeamHypotheses(
                 num_beams=self.num_beams,
                 length_penalty=self.length_penalty,
+                apply_length_penalty_to_custom_scores=self.apply_length_penalty_to_custom_scores,
                 early_stopping=self.do_early_stopping,
             )
             for _ in range(batch_size)
@@ -596,10 +601,13 @@ class CustomBeamSearchScorer(BeamScorer):
 
         # retrieve best hypotheses
         for i, beam_hyp in enumerate(self._beam_hyps):
-            # Custom score top hypotheses
+            # choose the top hypotheses according to the custom scores
             sorted_hyps = sorted(beam_hyp.beams, key=lambda x: x[0])[-self.num_beam_hyps_to_keep:]
-            # sort by unperturbed score
-            sorted_hyps = sorted(sorted_hyps, key=lambda x: x[1])
+
+            if not self.sort_output_hyps_according_to_custom_scores:
+                # sort by unperturbed score
+                sorted_hyps = sorted(sorted_hyps, key=lambda x: x[1])
+
             for j in range(self.num_beam_hyps_to_keep):
                 best_hyp_tuple = sorted_hyps.pop()
                 best_custom_score, best_score, best_hyp = best_hyp_tuple
@@ -633,15 +641,19 @@ class CustomBeamSearchScorer(BeamScorer):
 
 
 class CustomScoreBeamHypotheses(BeamHypotheses):
-    def __init__(self, num_beams: int, length_penalty: float, early_stopping: bool):
+    def __init__(self, num_beams: int, length_penalty: float, apply_length_penalty_to_custom_scores: bool, early_stopping: bool):
         super().__init__(num_beams, length_penalty, early_stopping)
+        self.apply_length_penalty_to_custom_scores = apply_length_penalty_to_custom_scores
 
     def add(self, hyp: torch.LongTensor, sum_logprobs: float, custom_score: float):
         """
         Add a new hypothesis to the list.
         """
         score = sum_logprobs / (hyp.shape[-1] ** self.length_penalty)
-        custom_score = custom_score / (hyp.shape[-1] ** self.length_penalty)
+        custom_score = custom_score
+        if self.apply_length_penalty_to_custom_scores:
+            custom_score /= (hyp.shape[-1] ** self.length_penalty)
+
         if len(self) < self.num_beams or custom_score > self.worst_score:
             self.beams.append((custom_score, score, hyp))
             if len(self) > self.num_beams:
