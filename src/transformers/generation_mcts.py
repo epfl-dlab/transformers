@@ -5,7 +5,6 @@ import networkx as nx
 import numpy as np
 import torch
 from tqdm import tqdm
-from transformers import RepetitionPenaltyLogitsProcessor
 
 
 def pad_sequences_to_left(sequences, batch_first=False, padding_value=0):
@@ -31,7 +30,7 @@ def pad_sequences_to_left(sequences, batch_first=False, padding_value=0):
     return out_tensor
 
 
-def pad_sequences_to_left_states(device, sequences, padding_value=0, max_len=0):
+def pad_sequences_to_left_states(sequences, padding_value=0, max_len=0):
     # Same function as in PyTorch, but add padding to left to be used with Auto Regressive models
     # assuming trailing dimensions and type of all the Tensors
     # in sequences are same and fetching those from sequences[0]
@@ -43,7 +42,7 @@ def pad_sequences_to_left_states(device, sequences, padding_value=0, max_len=0):
                 # decoder
                 current_shape = sequences[0][layer][kv].shape
                 new_shape = (B, current_shape[0], max_len, current_shape[2])
-                out[layer][kv] = sequences[0][layer][kv].new_full(new_shape, padding_value, device=device)
+                out[layer][kv] = sequences[0][layer][kv].new_full(new_shape, padding_value)
                 for b in range(B):
                     length = sequences[b][layer][kv].shape[1]
                     out[layer][kv][b, :, max_len - length:, ...] = sequences[b][layer][kv]
@@ -55,15 +54,15 @@ def pad_sequences_to_left_states(device, sequences, padding_value=0, max_len=0):
 
 class NumpyMCTS():
     def __init__(self, root_fun, rec_fun, batch_size, num_simulations, num_actions, num_sparse_actions, pb_c_init,
-                 temperature, alpha, repetition_penalty, device, classifier_caching=False):
-        self.device = device
+                 lm_device, lm_caching=True, classifier_caching=False, argpartition_reproducibility=False):
+        self._lm_device = lm_device
+        self._lm_caching = lm_caching
+        self._argpartition_reproducibility = argpartition_reproducibility
         self._batch_size = batch_size
         self._num_simulations = num_simulations
         self._num_actions = num_actions
         self._num_sparse_actions = min(num_sparse_actions, num_actions)
         self._pb_c_init = pb_c_init
-        self._temperature = temperature
-        self.alpha = alpha
         self._classifier_caching = classifier_caching
         if classifier_caching:
             raise NotImplementedError(
@@ -73,7 +72,7 @@ class NumpyMCTS():
         self._rec_fun = rec_fun  # a function called in the tree
         # self._adaptive_min_values = np.zeros(batch_size, dtype=np.float32)
         # self._adaptive_max_values = np.zeros(batch_size, dtype=np.float32)
-        self._labels = torch.zeros((batch_size, 4), dtype=torch.uint8, device=device)
+        self._labels = torch.zeros((batch_size, 4), dtype=torch.uint8, device=lm_device)
 
         # Allocate all necessary storage.
         # For a given search associated to a batch-index, node i is the i-th node
@@ -111,7 +110,6 @@ class NumpyMCTS():
         self._original_attention_mask = {}
         self._batch_range = np.arange(batch_size)
         self._reset_tree()
-        self._repetition_penalty = RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty)
 
     def _reset_tree(self):
         """Resets the tree arrays."""
@@ -140,14 +138,17 @@ class NumpyMCTS():
             original_tokens_ids,
             original_attention_mask,
             pad_token_id,
+            eos_token_id,
             max_input_sequence_length,
             tokens_to_generate,
             simulation_callbacks=None,
     ):
         self._reset_tree()
+
         # Evaluate the root.
-        prior, values, states, classi_states = self._root_fun(original_tokens_ids, original_attention_mask,
-                                                              self._labels, self._temperature, self._repetition_penalty)
+        likelihoods = np.array([1.0 for _ in self._batch_range])
+        prior, values, states, classi_states = self._root_fun(self, original_tokens_ids, original_attention_mask,
+                                                              self._labels, likelihoods)
 
         # self._adaptive_min_values = 1
         # self._adaptive_max_values = 1 + 1e-6
@@ -161,6 +162,7 @@ class NumpyMCTS():
         existing_nodes = 0
         tokens_pbar = tqdm(total=tokens_to_generate, desc="Tokens generated")
         for i in range(tokens_to_generate):
+            # torch.cuda.empty_cache()
             if simulation_callbacks is not None:
                 for simulation_callback in simulation_callbacks:
                     simulation_callback(self, i, -1)
@@ -168,7 +170,8 @@ class NumpyMCTS():
             for sim in range(self._num_simulations):
                 node_indices, actions = self.simulate()
                 next_node_index = sim + 1 + existing_nodes  # root is 0, therefore we offset by 1.
-                self.expand(node_indices, actions, next_node_index, pad_token_id, max_input_sequence_length)
+                self.expand(node_indices, actions, next_node_index, pad_token_id, eos_token_id,
+                            max_input_sequence_length)
                 leaf_indices.fill(next_node_index)
                 self.backward(leaf_indices)
 
@@ -193,8 +196,6 @@ class NumpyMCTS():
             temp_topk_mapping = np.zeros(batch_node_action, dtype=np.int32)
             temp_children_index = np.full(batch_node_action, -1, dtype=np.int32)
             temp_children_prior = np.zeros(batch_node_action, dtype=np.float32)
-            temp_children_probas = np.zeros((self._batch_size, num_nodes, self._num_sparse_actions, 2),
-                                            dtype=np.float32)
             temp_children_values = np.zeros(batch_node_action, dtype=np.float32)
             temp_children_visits = np.zeros(batch_node_action, dtype=np.int32)
             temp_original_states = {}
@@ -235,23 +236,25 @@ class NumpyMCTS():
                     temp_children_values[b, new_id] = self._children_values[b, old_id]
                     temp_children_visits[b, new_id] = self._children_visits[b, old_id]
 
-                    temp_original_states[(b, new_id)] = self._original_states[(b, old_id)]
+                    if self._lm_caching:
+                        temp_original_states[(b, new_id)] = self._original_states[(b, old_id)]
                     if self._classifier_caching:
                         temp_classi_states[(b, new_id)] = self._classi_states[(b, old_id)]
                     temp_original_token_ids[(b, new_id)] = self._original_token_ids[(b, old_id)]
                     temp_original_attention_mask[(b, new_id)] = self._original_attention_mask[(b, old_id)]
 
-                temp_original_states[(b, 0)] = [
-                    [
-                        torch.cat((self._original_states[(b, 0)][layer][kv],
-                                   self._original_states[(b, new_root_id)][layer][kv]), dim=1)
-                        for kv in range(len(self._original_states[(b, 0)][layer]))[:2]
-                    ] + [
-                        self._original_states[(b, 0)][layer][kv]
-                        for kv in range(len(self._original_states[(b, 0)][layer]))[2:]
+                if self._lm_caching:
+                    temp_original_states[(b, 0)] = [
+                        [
+                            torch.cat((self._original_states[(b, 0)][layer][kv],
+                                       self._original_states[(b, new_root_id)][layer][kv]), dim=1)
+                            for kv in range(len(self._original_states[(b, 0)][layer]))[:2]
+                        ] + [
+                            self._original_states[(b, 0)][layer][kv]
+                            for kv in range(len(self._original_states[(b, 0)][layer]))[2:]
+                        ]
+                        for layer in range(len(self._original_states[(b, 0)]))
                     ]
-                    for layer in range(len(self._original_states[(b, 0)]))
-                ]
                 if self._classifier_caching:
                     temp_classi_states[(b, 0)] = torch.cat(
                         (self._classi_states[(b, 0)], self._classi_states[(b, new_root_id)]), 3)
@@ -281,7 +284,7 @@ class NumpyMCTS():
             if (self._is_terminal[:, 0].all()):
                 break
 
-        return torch.stack([self._original_token_ids[(b, 0)] for b in range(self._batch_size)])
+        return torch.stack([self._original_token_ids[(b, 0)] for b in range(self._batch_size)]).to(self._lm_device)
 
     def dense_visit_counts(self):
         root_index = 0
@@ -373,46 +376,49 @@ class NumpyMCTS():
         # return torch.cat(classi_state_array, 3)
         raise NotImplementedError()
 
-    def expand(self, node_indices, actions, next_node_index, pad_token_id, max_input_sequence_length):
+    def expand(self, node_indices, actions, next_node_index, pad_token_id, eos_token_id, max_input_sequence_length):
         """Creates and evaluate child nodes from given nodes and unexplored actions."""
         # Retrieve token ids and masks for nodes to be evaluated.
         original_tokens_ids = pad_sequences_to_left(
             [self._original_token_ids[(b, n)] for b, n in enumerate(node_indices)], True, pad_token_id)
         original_attention_masks = pad_sequences_to_left(
             [self._original_attention_mask[(b, n)] for b, n in enumerate(node_indices)], True, 0)
-        depths = torch.tensor([self._depth[(b, n)] + 1 for b, n in enumerate(node_indices)], device=self.device)
+        depths = torch.tensor([self._depth[(b, n)] + 1 for b, n in enumerate(node_indices)], device=self._lm_device)
         children_priors = np.array([self._children_prior[(b, n)][actions[b]] for b, n in enumerate(node_indices)])
         likelihoods = np.array([self._likelihoods[(b, n)] for b, n in enumerate(node_indices)])
         previous_values = np.array([self._values[(b, n)] for b, n in enumerate(node_indices)])
         previous_node_is_terminal = self._is_terminal[self._batch_range, node_indices[self._batch_range]]  # (B)
 
-        original_states_list = pad_sequences_to_left_states(
-            self.device,
-            [self.get_original_states_from_node(b, n.item(), depths[b].item()) for b, n in enumerate(node_indices)],
-            0, max_len=len(original_tokens_ids[0])
-        )
+        if self._lm_caching:
+            original_states_list = pad_sequences_to_left_states(
+                [self.get_original_states_from_node(b, n.item(), depths[b].item()) for b, n in enumerate(node_indices)],
+                0, max_len=len(original_tokens_ids[0])
+            )
+        else:
+            original_states_list = None
         if self._classifier_caching:
-            classi_states_tensor = pad_sequences_to_left_states(self.device, [
+            classi_states_tensor = pad_sequences_to_left_states([
                 self.get_classi_states_from_node(b, n, depths[b].item()) for b, n in enumerate(node_indices)], 0,
-                                                                max_len=len(original_tokens_ids[0]))
+                max_len=len(original_tokens_ids[0]))
         if (len(original_tokens_ids[0]) >= max_input_sequence_length):
             previous_node_is_terminal[
                 torch.sum(original_attention_masks, axis=1).cpu().numpy() >= max_input_sequence_length] = True
             original_tokens_ids = original_tokens_ids[:, -(max_input_sequence_length - 1):]
             original_attention_masks = original_attention_masks[:, -(max_input_sequence_length - 1):]
-            original_states_list = [
-                [
-                    # decoder
-                    original_states_list[layer][kv][:, :, -(max_input_sequence_length - 1):]
-                    for kv in range(len(original_states_list[layer]))[:2]
-                ] + [
-                    # encoder - not affected by max_sequence_limit
-                    # TODO verify this is correct
-                    original_states_list[layer][kv]
-                    for kv in range(len(original_states_list[layer]))[2:]
+            if self._lm_caching:
+                original_states_list = [
+                    [
+                        # decoder
+                        original_states_list[layer][kv][:, :, -(max_input_sequence_length - 1):]
+                        for kv in range(len(original_states_list[layer]))[:2]
+                    ] + [
+                        # encoder - not affected by max_sequence_limit
+                        # TODO verify this is correct
+                        original_states_list[layer][kv]
+                        for kv in range(len(original_states_list[layer]))[2:]
+                    ]
+                    for layer in range(len(original_states_list))
                 ]
-                for layer in range(len(original_states_list))
-            ]
             if self._classifier_caching:
                 classi_states_tensor = classi_states_tensor[:, :, :, :, -(max_input_sequence_length - 1):]
 
@@ -427,27 +433,32 @@ class NumpyMCTS():
         dense_actions[previous_node_is_terminal] = pad_token_id
         # Add actions to list of tokens and extend attention mask by 1
         original_tokens_ids = torch.cat((original_tokens_ids, torch.unsqueeze(
-            torch.tensor(dense_actions, dtype=torch.long, device=self.device), 1)), dim=1)
+            torch.tensor(dense_actions, dtype=torch.long, device=self._lm_device), 1)), dim=1)
         original_attention_masks = torch.cat((original_attention_masks, torch.unsqueeze(
-            torch.ones(len(dense_actions), dtype=torch.long, device=self.device), 1)), dim=1)
+            torch.ones(len(dense_actions), dtype=torch.long, device=self._lm_device), 1)), dim=1)
 
         # Check if expanded nodes are terminal
-        expanded_node_is_terminal = np.logical_or((dense_actions == pad_token_id), previous_node_is_terminal)
+        expanded_node_is_terminal = np.logical_or((dense_actions == eos_token_id), previous_node_is_terminal)
         # Evaluate nodes.
-        (prior, values, next_states, classi_states) = self._rec_fun(original_states, classi_states, original_tokens_ids,
-                                                                    original_attention_masks, self._labels,
-                                                                    self._temperature, self._repetition_penalty)
+        (prior, values, next_states, classi_states) = self._rec_fun(
+            mcts_object=self,
+            original_states=original_states,
+            classi_states=classi_states,
+            original_token_ids=original_tokens_ids,
+            original_attention_mask=original_attention_masks,
+            target_labels=self._labels,
+            likelihoods=likelihoods,
+            parent_nodes=node_indices,
+        )
         values[previous_node_is_terminal] = previous_values[previous_node_is_terminal]
-
-        if len(next_states[0]) == 4:
-            assert torch.equal(next_states[0][3][0], self._original_states[(0, 0)][0][3])
 
         # Store unpaded version of inputs to save space
         original_attention_masks = [
-            torch.cat((self._original_attention_mask[(b, n)], torch.ones(1, dtype=torch.long, device=self.device)),
+            torch.cat((self._original_attention_mask[(b, n)], torch.ones(1, dtype=torch.long, device=self._lm_device)),
                       dim=0) for b, n in enumerate(node_indices)]
         original_tokens_ids = [
-            torch.cat((self._original_token_ids[(b, n)], torch.tensor([dense_actions[b]], device=self.device)), dim=0)
+            torch.cat((self._original_token_ids[(b, n)], torch.tensor([dense_actions[b]], device=self._lm_device)),
+                      dim=0)
             for b, n in enumerate(node_indices)]
 
         # Create the new nodes.
@@ -467,7 +478,11 @@ class NumpyMCTS():
     def create_node(self, node_index, prior, likelihoods, values, original_states, original_tokens_ids,
                     original_attention_masks, classi_states, expanded_node_is_terminal):
         # Truncate the prior to only keep the top k logits
-        prior_topk_indices = np.argpartition(prior, -self._num_sparse_actions, axis=-1)[:, -self._num_sparse_actions:]
+        if self._argpartition_reproducibility:
+            kth = range(-self._num_sparse_actions, 0)
+        else:
+            kth = -self._num_sparse_actions
+        prior_topk_indices = np.argpartition(prior, kth, axis=-1)[:, -self._num_sparse_actions:]
         prior = prior[self._batch_range[:, None], prior_topk_indices]  # (B, A)
         # Store the indices of the top k logits
         self._topk_mapping[self._batch_range, node_index, :] = prior_topk_indices
@@ -488,28 +503,25 @@ class NumpyMCTS():
         # If root, store the whole states
         if (node_index == 0):
             for b in range(len(original_tokens_ids)):
-                # TODO encoder states are actually always the same and can be cached only once
-                self._original_states[(b, node_index)] = [
-                    [torch.clone(original_states[layer][kv][b]) for kv in range(len(original_states[layer]))]
-                    for layer in range(len(original_states))
-                ]
+                if self._lm_caching:
+                    self._original_states[(b, node_index)] = [
+                        [torch.clone(original_states[layer][kv][b]) for kv in range(len(original_states[layer]))]
+                        for layer in range(len(original_states))
+                    ]
                 if self._classifier_caching:
                     self._classi_states[(b, node_index)] = torch.clone(classi_key_value_tensor[:, :, b])
         # Else just store the additional token hidden states to save space
         else:
             for b in range(len(original_tokens_ids)):
-                self._original_states[(b, node_index)] = [
-                    [
-                        # decoder [:2], consult `https://huggingface.co/docs/transformers/main_classes/output#transformers.modeling_outputs.BaseModelOutputWithPast.past_key_values`
-                        torch.clone(original_states[layer][kv][b, :, -1:])
-                        for kv in range(len(original_states[layer]))[:2]
-                    ] + [
-                        # encoder [2:], if encoder-decoder based generator
-                        torch.clone(original_states[layer][kv][b])
-                        for kv in range(len(original_states[layer]))[2:]
+                if self._lm_caching:
+                    self._original_states[(b, node_index)] = [
+                        [
+                            # decoder [:2], consult `https://huggingface.co/docs/transformers/main_classes/output#transformers.modeling_outputs.BaseModelOutputWithPast.past_key_values`
+                            torch.clone(original_states[layer][kv][b, :, -1:])
+                            for kv in range(len(original_states[layer]))[:2]
+                        ]
+                        for layer in range(len(original_states))
                     ]
-                    for layer in range(len(original_states))
-                ]
                 if self._classifier_caching:
                     self._classi_states[(b, node_index)] = torch.clone(classi_key_value_tensor[:, :, b, :, -1:])
 
@@ -587,7 +599,7 @@ class NumpyMCTS():
 
         for action in range(len(node_children_prior)):
             token_id = self._topk_mapping[batch_idx, node_idx, action]
-            token = tokenizer.decode(token_id)
+            token = tokenizer.decode([token_id])
             child_idx = int(self._children_index[batch_idx, node_idx, action])
             is_child_leaf = child_idx == -1
 
@@ -628,8 +640,6 @@ class NumpyMCTS():
             "num_nodes": int(self._num_nodes),
             "target_label": float(self._labels[batch_idx, 0]),
             "pb_c_init": float(self._pb_c_init),
-            "temperature": float(self._temperature),
-            "alpha": float(self.alpha),
         }
         attributes.update(self._get_node_attributes(batch_idx, root_idx))
         return attributes
@@ -654,11 +664,3 @@ class NumpyMCTS():
                           for key, value in kwargs.items()])
         desc = desc.strip('\n')
         return desc
-
-
-if __name__ == '__main__':
-    from tests.test_uni_pplmcts import TestUniPPLMCTSUsingBurekLM
-
-    unittest = TestUniPPLMCTSUsingBurekLM()
-    unittest.setUp()
-    unittest._visualize_tree_traversal()

@@ -13,21 +13,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
+import inspect
+import pdb
 import warnings
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
-import torch
-import torch.distributed as dist
-from torch import nn
-
 import chex
 import jax
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch import nn
+
 import mctx
 from mctx import PolicyOutput
 from mctx._src import base as mctx_base
 from mctx._src import qtransforms
-
 from .file_utils import ModelOutput
 from .generation_beam_search import BeamScorer, BeamSearchScorer, CustomBeamSearchScorer
 from .generation_logits_process import (
@@ -48,6 +53,7 @@ from .generation_logits_process import (
     TopPLogitsWarper,
     ValueLogitsProcessor,
 )
+from .generation_mcts import NumpyMCTS
 from .generation_stopping_criteria import (
     MaxLengthCriteria,
     MaxNewTokensCriteria,
@@ -56,7 +62,6 @@ from .generation_stopping_criteria import (
     validate_stopping_criteria,
 )
 from .utils import logging
-
 
 logger = logging.get_logger(__name__)
 
@@ -379,6 +384,24 @@ class MCTSOutput(ModelOutput):
 
     sequences: torch.LongTensor = None
     policy_output: mctx_base.PolicyOutput = None
+
+
+@dataclass
+class PPLMCTSOutput(ModelOutput):
+    """
+    Base class for outputs of generation models using Monte Carlo Tree Search.
+
+
+    Args:
+        sequences (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`):
+            The generated sequences. The second dimension (sequence_length) is either equal to :obj:`max_length` or
+            shorter if all batches finished early due to the :obj:`eos_token_id`.
+        pplmcts_object (:obj:`NumpyMCTS`):
+            The object that performed the search. Can be used to investigate the underlying search tree
+    """
+
+    sequences: torch.LongTensor = None
+    pplmcts_object: mctx_base.PolicyOutput = None
 
 
 @dataclass
@@ -737,8 +760,8 @@ class GenerationMixin:
         diversity_penalty: Optional[float] = None,
         prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
         tokens_considered_by_value_processor: int = None,
-        value_model = None,
-        value_model_kwargs = None,
+        value_model=None,
+        value_model_kwargs=None,
         contribution_factor: Optional[float] = 0.5,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -748,6 +771,7 @@ class GenerationMixin:
         forced_eos_token_id: Optional[int] = None,
         remove_invalid_values: Optional[bool] = None,
         synced_gpus: Optional[bool] = None,
+        use_pplmcts: bool = False,
         use_mcts: bool = False,
         reuse_cached_jitted_mcts: bool = False,
         mcts_debug_prints: bool = False,
@@ -758,7 +782,9 @@ class GenerationMixin:
         mcts_pb_c_base: chex.Numeric = 19652,
         mcts_num_simulations: int = 30,
         mcts_topk_actions: Optional[int] = None,
-        mcts_value_model = None,
+        mcts_simulation_callbacks=None,
+        mcts_fp16: bool = True,
+        mcts_argpartition_reproducibility=False,
         **model_kwargs,
     ) -> Union[
         GreedySearchOutput,
@@ -767,7 +793,8 @@ class GenerationMixin:
         BeamSampleOutput,
         CustomScoreBeamSearchOutput,
         MCTSOutput,
-        torch.LongTensor
+        torch.LongTensor,
+        PPLMCTSOutput,
     ]:
         r"""
         Generates sequences for models with a language modeling head. The method currently supports greedy decoding,
@@ -1031,22 +1058,30 @@ class GenerationMixin:
             )
 
         # determine generation mode
-        if use_mcts:
-            is_mcts = True
+        if use_mcts or use_pplmcts:
+            is_mcts = use_mcts
+            is_pplmcts = use_pplmcts
+            assert use_mcts != use_pplmcts, "Choose one version of MCTS: mcts or pplmcts."
+            assert num_beams == 1
+            assert num_beam_groups == 1
+
             is_greedy_gen_mode = False
             is_sample_gen_mode = False
             is_beam_gen_mode = False
             is_beam_sample_gen_mode = False
             is_group_beam_gen_mode = False
             is_beam_stochastic_gen_mode = False
+            is_beam_value_gen_mode = False
         else:
             is_mcts = False
+            is_pplmcts = False
             is_greedy_gen_mode = (num_beams == 1) and (num_beam_groups == 1) and do_sample is False
             is_sample_gen_mode = (num_beams == 1) and (num_beam_groups == 1) and do_sample is True
 
             is_beam_gen_mode = False
             is_beam_sample_gen_mode = False
             is_beam_stochastic_gen_mode = False
+            is_beam_value_gen_mode = False
 
             if do_sample and do_stochastic:
                 raise ValueError(
@@ -1081,7 +1116,9 @@ class GenerationMixin:
                 if value_model is None:
                     raise ValueError("No `value_model` found for value guided beam search.")
                 if tokens_considered_by_value_processor is None:
-                    raise ValueError("`tokens_considered_by_value_processor` must be set for value guided beam search.")
+                    raise ValueError(
+                        "`tokens_considered_by_value_processor` must be set for value guided beam search."
+                    )
 
             is_group_beam_gen_mode = (num_beams > 1) and (num_beam_groups > 1)
             if num_beam_groups > num_beams:
@@ -1091,8 +1128,22 @@ class GenerationMixin:
                     "Diverse beam search cannot be used in sampling mode. Make sure that `do_sample` is set to `False`."
                 )
 
-        assert sum([is_mcts, is_greedy_gen_mode, is_sample_gen_mode, is_beam_gen_mode,
-                    is_beam_sample_gen_mode, is_group_beam_gen_mode, is_beam_stochastic_gen_mode]) == 1
+        assert (
+            sum(
+                [
+                    is_mcts,
+                    is_pplmcts,
+                    is_greedy_gen_mode,
+                    is_sample_gen_mode,
+                    is_beam_gen_mode,
+                    is_beam_sample_gen_mode,
+                    is_group_beam_gen_mode,
+                    is_beam_stochastic_gen_mode,
+                    is_beam_value_gen_mode,
+                ]
+            )
+            == 1
+        )
 
         # set model_kwargs
         model_kwargs["use_cache"] = use_cache
@@ -1304,7 +1355,9 @@ class GenerationMixin:
                 raise ValueError("`max_length` needs to be a stopping_criteria for now.")
 
             if tokens_considered_by_value_processor < 2 * num_beams:
-                raise ValueError("`tokens_considered_by_value_processor` has to be larger or equal to `2 * num_beams`.")
+                raise ValueError(
+                    "`tokens_considered_by_value_processor` has to be larger or equal to `2 * num_beams`."
+                )
 
             beam_scorer = CustomBeamSearchScorer(
                 batch_size=batch_size,
@@ -1319,7 +1372,9 @@ class GenerationMixin:
                 expanded_return_idx = (
                     torch.arange(input_ids.shape[0]).view(-1, 1).repeat(1, num_beams).view(-1).to(input_ids.device)
                 )
-                value_model_kwargs["target_ids"] = value_model_kwargs["target_ids"].index_select(0, expanded_return_idx)
+                value_model_kwargs["target_ids"] = value_model_kwargs["target_ids"].index_select(
+                    0, expanded_return_idx
+                )
 
             # interleave with `num_beams`
             input_ids, model_kwargs = self._expand_inputs_for_generation(
@@ -1392,7 +1447,7 @@ class GenerationMixin:
                     " for encoder-decoder models."
                 )
 
-            if mcts_value_model is None:
+            if value_model is None:
                 raise ValueError("The value function is not optional for MCTS.")
 
             if top_k is not None and top_k != 0:
@@ -1428,17 +1483,15 @@ class GenerationMixin:
                     temperature=temperature if temperature is not None else 1.0,
                 )
 
-            # TODO Do all models have max_position_embeddings?
-            #  How to otherwise determine the maximum input length of the model?
-            max_depth = self.config.max_position_embeddings - input_ids.shape[-1]
-
             root = self.mcts_root_fn(
                 input_ids=input_ids,
-                value_model=mcts_value_model,
+                value_model=value_model,
                 logits_processor=logits_processor,
                 topk_actions=mcts_topk_actions,
                 stopping_criteria=stopping_criteria,
                 mcts_debug_prints=mcts_debug_prints,
+                max_length=stopping_criteria.max_length,
+                fp16=mcts_fp16,
                 **model_kwargs,
             )
 
@@ -1453,10 +1506,82 @@ class GenerationMixin:
                 jitted_run_policy = self.__mcts_jit_cache
             else:
                 jitted_run_policy = jax.jit(run_policy)
-            policy_output = jitted_run_policy(root, max_depth)
 
-            # TODO not all actions might be used from the policy_output if early stopping was used
+            max_new_tokens = stopping_criteria.max_length - input_ids.shape[-1]
+            policy_output = jitted_run_policy(root, max_new_tokens)
+
             return self.mcts_finalize(policy_output=policy_output)
+        elif is_pplmcts:
+            if value_model is None:
+                raise ValueError("The value function is not optional for MCTS.")
+            if value_model_kwargs is None:
+                value_model_kwargs = {}
+            if mcts_pb_c_init is None:
+                raise ValueError("`mcts_pb_c_init` argument is necessary for MCTS decoding")
+            if mcts_num_simulations is None:
+                raise ValueError("`mcts_num_simulations` argument is necessary for MCTS decoding")
+            if mcts_topk_actions is None:
+                raise ValueError("`mcts_topk_actions` argument is necessary for MCTS decoding")
+            if max_length is None:
+                raise ValueError("`max_length` argument is necessary for MCTS decoding")
+            if self.config.is_encoder_decoder and len(input_ids) > 1:
+                raise ValueError(
+                    "Because of padding of decoder input ids, "
+                    "batch size is currently only supported for decoder-only models."
+                )
+
+            if temperature is not None and temperature != 1.0:
+                logits_processor.append(TemperatureLogitsWarper(temperature))
+            if top_k is not None and top_k != 0:
+                if mcts_topk_actions:
+                    # TODO top_k and mcts_topk_actions should be the same argument.
+                    #  They are separated only for testing if mcts_topk_actions is
+                    #  implemented correctly in lmcache
+                    assert top_k == mcts_topk_actions
+            if top_p is not None and top_p < 1.0:
+                logits_processor.append(TopPLogitsWarper(top_p=top_p))
+
+            assert "attention_mask" in model_kwargs
+            if self.config.is_encoder_decoder:
+                attention_mask = torch.ones_like(input_ids)
+            else:
+                attention_mask = model_kwargs.pop("attention_mask")
+
+            # 10. prepare function called at root node (root_fun) and at children nodes (rec_fun)
+            value_cache = {}  # "parent token ids": [value for child 1, value for child 2, ..., value for child N]
+            root_fun = functools.partial(self.pplmcts_root_fun, logits_processor, model_kwargs, mcts_fp16,
+                                           value_model, value_model_kwargs, value_cache, pad_token_id)
+            rec_fun = functools.partial(self.pplmcts_rec_fun, logits_processor, model_kwargs, mcts_fp16,
+                                          value_model, value_model_kwargs, value_cache, pad_token_id)
+
+            # 11. prepare mcts decoder
+            mcts = NumpyMCTS(
+                root_fun=root_fun,
+                rec_fun=rec_fun,
+                batch_size=input_ids.shape[0],
+                num_simulations=mcts_num_simulations,
+                num_actions=self.config.vocab_size,
+                num_sparse_actions=mcts_topk_actions,
+                pb_c_init=mcts_pb_c_init,
+                lm_device=input_ids.device,
+                lm_caching=use_cache,
+                argpartition_reproducibility=mcts_argpartition_reproducibility,
+            )
+            mcts.set_labels(torch.ones((len(input_ids), 1)))  # Dummy labels since our value functions do not use them
+
+            # 12. run mcts search
+            max_new_tokens = stopping_criteria.max_length - input_ids.shape[-1]
+            sequences = mcts.search(
+                original_tokens_ids=input_ids,
+                original_attention_mask=attention_mask,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                max_input_sequence_length=stopping_criteria.max_length,
+                tokens_to_generate=max_new_tokens,
+                simulation_callbacks=mcts_simulation_callbacks,
+            )
+
+            return PPLMCTSOutput(sequences=sequences, pplmcts_object=mcts)
 
     def mcts_root_fn(self, value_model, **kwargs) -> mctx_base.RootFnOutput:
         raise NotImplementedError("This method needs to be implemented on a per-model basis for MCTS to be supported.")
@@ -1470,6 +1595,166 @@ class GenerationMixin:
 
     def mcts_stopping_criteria_fn(self, embedding: mctx_base.RecurrentState) -> bool:
         raise NotImplementedError("This method needs to be implemented on a per-model basis for MCTS to be supported.")
+
+    def pplmcts_root_fun(
+            self, logits_processor, model_kwargs, mcts_fp16, value_model, value_model_kwargs, value_cache, pad_token_id,
+            # PPLMCTS arguments below
+            pplmcts_object,
+            original_token_ids,
+            original_attention_mask,
+            target_labels,
+            likelihoods,
+    ):
+        # Forward pass of LM to get priors and states
+        if self.config.is_encoder_decoder:
+            assert "attention_mask" in model_kwargs
+            model_inputs = self.prepare_inputs_for_generation(original_token_ids, **model_kwargs)
+            model_inputs["decoder_attention_mask"] = original_attention_mask
+        else:
+            assert "attention_mask" not in model_kwargs
+            model_inputs = self.prepare_inputs_for_generation(
+                original_token_ids, attention_mask=original_attention_mask, **model_kwargs
+            )
+
+        with torch.no_grad():
+            with torch.cuda.amp.autocast() if mcts_fp16 else ExitStack():
+                outputs = self(
+                    **model_inputs,
+                    return_dict=True,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                )
+            states = outputs.past_key_values if "past_key_values" in outputs else None
+
+            logits: torch.Tensor = outputs.logits[:, -1, :]
+            logits = logits_processor(original_token_ids, logits)
+            priors = F.softmax(logits, dim=-1).detach().cpu().numpy()
+
+        # Use of our discriminator to get values
+        with torch.no_grad():
+            with torch.cuda.amp.autocast() if mcts_fp16 else ExitStack():
+                values = torch.full((len(original_token_ids),), float("-inf"))
+                classi_past_key_values = None
+
+        return priors, np.array(values), states, classi_past_key_values
+
+    def pplmcts_rec_fun(
+            self, logits_processor, model_kwargs, mcts_fp16, value_model, value_model_kwargs, value_cache, pad_token_id,
+            # PPLMCTS arghuments below
+            mcts_object: NumpyMCTS,
+            original_states: List[List[torch.Tensor]],
+            classi_states: Optional[List[List[torch.Tensor]]],
+            original_token_ids: torch.Tensor,
+            original_attention_mask: torch.Tensor,
+            target_labels: torch.Tensor,
+            likelihoods: np.ndarray,
+            parent_nodes: np.ndarray,
+    ):
+        # Forward pass of LM to get priors and states
+        if self.config.is_encoder_decoder:
+            assert "attention_mask" in model_kwargs
+            model_inputs = self.prepare_inputs_for_generation(
+                original_token_ids, past=original_states, **model_kwargs
+            )
+            model_inputs["decoder_attention_mask"] = original_attention_mask
+        else:
+            assert "attention_mask" not in model_kwargs
+            model_inputs = self.prepare_inputs_for_generation(
+                original_token_ids,
+                attention_mask=original_attention_mask,
+                past=original_states,
+                **model_kwargs,
+            )
+
+        with torch.no_grad():
+            with torch.cuda.amp.autocast() if mcts_fp16 else ExitStack():
+                outputs = self(
+                    **model_inputs,
+                    return_dict=True,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                )
+            next_states = outputs.past_key_values if "past_key_values" in outputs else None
+
+            logits: torch.Tensor = outputs.logits[:, -1, :]
+            logits = logits_processor(original_token_ids, logits)
+            priors = F.softmax(logits, dim=-1).detach().cpu().numpy()
+
+        # Use of our discriminator to get values
+        with torch.no_grad():
+            with torch.cuda.amp.autocast() if mcts_fp16 else ExitStack():
+                classi_past_key_values = None
+                if "next_token_ids" not in inspect.signature(value_model.evaluate).parameters.keys():
+                    # ~~~ Simple value models ~~~ #
+                    values = value_model.evaluate(
+                        original_token_ids.tolist(),
+                        likelihood=likelihoods,
+                        **value_model_kwargs,
+                    )
+                else:
+                    # ~~~ Complicated value models ~~~ #
+                    # 1. Fetch necessary data
+                    next_token_ids = mcts_object._topk_mapping[mcts_object._batch_range, parent_nodes]
+                    next_token_ids = torch.tensor(next_token_ids, device=original_token_ids.device)
+                    padded_parent_token_ids = original_token_ids[:, :-1]
+                    parent_indices = [
+                        tuple(mcts_object._original_token_ids[(b, n)].tolist())
+                        for b, n in zip(mcts_object._batch_range, parent_nodes)
+                    ]
+                    likelihoods = torch.tensor(likelihoods, device=original_token_ids.device)
+
+                    # 2. Prepare value_model forward pass and skip cached values
+                    parent_idx_for_processing = []
+                    padded_parent_token_ids_for_processing = []
+                    next_token_ids_for_processing = []
+                    likelihoods_for_processing = []
+                    for parent_idx, parent_ids, ids, topk, l in zip(
+                            parent_indices,
+                            padded_parent_token_ids,
+                            original_token_ids,
+                            next_token_ids,
+                            likelihoods,
+                    ):
+                        if parent_idx in value_cache:
+                            assert ids[-1] == pad_token_id or ids[-1] in topk
+                            continue
+                        else:
+                            parent_idx_for_processing.append(parent_idx)
+                            padded_parent_token_ids_for_processing.append(parent_ids[None, ...])
+                            next_token_ids_for_processing.append(topk[None, ...])
+                            likelihoods_for_processing.append(l[None, ...])
+
+                    # 3. Value model forward pass
+                    if len(padded_parent_token_ids_for_processing) > 0:
+                        children_values = value_model.evaluate(
+                            torch.cat(padded_parent_token_ids_for_processing),
+                            next_token_ids=torch.cat(next_token_ids_for_processing),
+                            likelihood=torch.cat(likelihoods_for_processing),
+                            **value_model_kwargs,
+                        )
+                        # 4. Update cache by forward pass results
+                        for parent_idx, v, topk in zip(
+                                parent_idx_for_processing, children_values, next_token_ids_for_processing
+                        ):
+                            topk = topk.squeeze(0)
+                            value_cache[parent_idx] = {"children_values": v, "topk": topk}
+
+                    # 5. Create the values to be returned by unpacking from cache
+                    values = []
+                    for parent_idx, child_token, topk in zip(
+                            parent_indices,
+                            original_token_ids[:, -1],
+                            next_token_ids,
+                    ):
+                        child_idx = (topk == child_token).nonzero(as_tuple=True)[0]
+                        if child_idx.numel() == 0:
+                            assert child_token == pad_token_id
+                            value = float("-inf")
+                        else:
+                            value = value_cache[parent_idx]["children_values"][child_idx.item()]
+                        values.append(value)
+
+        return priors, np.array(values), next_states, classi_past_key_values
 
     def greedy_search(
         self,
@@ -2532,7 +2817,7 @@ class GenerationMixin:
     def stochastic_beam_search(
         self,
         input_ids: torch.LongTensor,
-        beam_scorer: StochasticBeamSearchScorer,
+        beam_scorer: CustomBeamSearchScorer,
         logits_processor: Optional[LogitsProcessorList] = None,
         stopping_criteria: Optional[StoppingCriteriaList] = None,
         temperature_warper: Optional[LogitsProcessorList] = None,
@@ -2763,8 +3048,7 @@ class GenerationMixin:
         value_model_kwargs: dict = None,
         **model_kwargs,
     ) -> Union[CustomScoreBeamSearchOutput, torch.LongTensor]:
-        r"""
-        """
+        r""" """
         # init values
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
         stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
