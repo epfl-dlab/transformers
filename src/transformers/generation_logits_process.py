@@ -24,9 +24,7 @@ import torch
 from .file_utils import add_start_docstrings
 from .utils.logging import get_logger
 
-
 logger = get_logger(__name__)
-
 
 LOGITS_PROCESSOR_INPUTS_DOCSTRING = r"""
     Args:
@@ -259,7 +257,7 @@ def _get_generated_ngrams(banned_ngrams, prev_input_ids, ngram_size, cur_len):
 
 
 def _calc_banned_ngram_tokens(
-    ngram_size: int, prev_input_ids: torch.Tensor, num_hypos: int, cur_len: int
+        ngram_size: int, prev_input_ids: torch.Tensor, num_hypos: int, cur_len: int
 ) -> List[Iterable[int]]:
     """Copied from fairseq for no_repeat_ngram in beam_search"""
     if cur_len + 1 < ngram_size:
@@ -362,8 +360,8 @@ class NoBadWordsLogitsProcessor(LogitsProcessor):
         if any(not isinstance(bad_word_ids, list) for bad_word_ids in bad_words_ids):
             raise ValueError(f"`bad_words_ids` has to be a list of lists, but is {bad_words_ids}.")
         if any(
-            any((not isinstance(token_id, (int, np.integer)) or token_id < 0) for token_id in bad_word_ids)
-            for bad_word_ids in bad_words_ids
+                any((not isinstance(token_id, (int, np.integer)) or token_id < 0) for token_id in bad_word_ids)
+                for bad_word_ids in bad_words_ids
         ):
             raise ValueError(
                 f"Each list in `bad_words_ids` has to be a list of positive integers, but is {bad_words_ids}."
@@ -387,7 +385,7 @@ class NoBadWordsLogitsProcessor(LogitsProcessor):
         elif len(tokens) > len(prev_tokens):
             # if bad word tokens are longer then prev input_ids they can't be equal
             return False
-        elif prev_tokens[-len(tokens) :].tolist() == tokens:
+        elif prev_tokens[-len(tokens):].tolist() == tokens:
             # if tokens match
             return True
         else:
@@ -504,11 +502,11 @@ class HammingDiversityLogitsProcessor(LogitsProcessor):
         self._num_sub_beams = num_beams // num_beam_groups
 
     def __call__(
-        self,
-        input_ids: torch.LongTensor,
-        scores: torch.FloatTensor,
-        current_tokens: torch.LongTensor,
-        beam_group_idx: int,
+            self,
+            input_ids: torch.LongTensor,
+            scores: torch.FloatTensor,
+            current_tokens: torch.LongTensor,
+            beam_group_idx: int,
     ) -> torch.FloatTensor:
         # hamming diversity: penalise using same token in current group which was used in previous groups at
         # the same time step
@@ -524,10 +522,10 @@ class HammingDiversityLogitsProcessor(LogitsProcessor):
         for batch_idx in range(batch_size):
             # predicted tokens of last time step of previous groups
             previous_group_tokens = current_tokens[
-                batch_idx * self._num_beams : batch_idx * self._num_beams + group_start_idx
-            ]
+                                    batch_idx * self._num_beams: batch_idx * self._num_beams + group_start_idx
+                                    ]
             token_frequency = torch.bincount(previous_group_tokens, minlength=vocab_size).to(scores.device)
-            scores[batch_idx * group_size : (batch_idx + 1) * group_size] -= self._diversity_penalty * token_frequency
+            scores[batch_idx * group_size: (batch_idx + 1) * group_size] -= self._diversity_penalty * token_frequency
 
         return scores
 
@@ -625,27 +623,27 @@ class ValueLogitsProcessor(LogitsProcessor):
     """
 
     def __init__(
-        self,
-        num_beams: int,
-        # top_hypothesis_factor: int,
-        num_tokens_considered_by_value_processor: int,
-        value_model,
-        contribution_factor: float,
-        eps=10e-8
+            self,
+            num_beams: int,
+            num_tokens_considered_by_value_processor: int,
+            value_model,
+            contribution_factor: float,
+            length_penalty: float,
+            eps=10e-8
     ):
         self.num_beams = num_beams
-        # self.num_hypothesis = top_hypothesis_factor * num_beams
         self.num_tokens_per_beam = num_tokens_considered_by_value_processor
         self.value_model = value_model
         self.contribution_factor = contribution_factor + eps
+        self.length_penalty = length_penalty
 
     def __call__(
-        self,
-        input_ids: torch.LongTensor,
-        next_token_scores: torch.FloatTensor,
-        vocab_size: int,
-        num_step: int,
-        **kwargs
+            self,
+            input_ids: torch.LongTensor,
+            next_token_scores: torch.FloatTensor,
+            vocab_size: int,
+            num_step: int,
+            **kwargs
     ) -> Tuple[Union[torch.LongTensor, torch.FloatTensor]]:
         # Retrieve the num_tokens_per_beam tokens with top scores
         scores, next_preliminary_tokens = torch.topk(
@@ -656,28 +654,11 @@ class ValueLogitsProcessor(LogitsProcessor):
                                            next_token_ids=next_preliminary_tokens,
                                            **kwargs)
 
-        # next_indices = (next_tokens / vocab_size).long()
-        # next_tokens = next_tokens % vocab_size
-
-        # # Compute value scores for retrieved tokens
-        # values = torch.zeros_like(scores)
-        # batch_size = scores.shape[0]
-        #
-        # for i in range(batch_size):
-        #     for j in range(self.num_hypothesis):
-        #         beam_id = i * self.num_beams + next_indices[i, j]
-        #         node_id = torch.cat([input_ids[beam_id], next_tokens[i, j].unsqueeze(-1)]).tolist()
-        #         likelihood = np.exp(scores[i, j].item())
-        #         values[i, j] = self.value_model.evaluate(node_id=node_id, likelihood=likelihood)
-
-        # # Sort returns by value scores
-        # value_scores, value_score_ids = value_scores.sort(dim=1, descending=True)
-        # scores = scores.gather(dim=1, index=value_score_ids)
-        # next_indices = next_indices.gather(dim=1, index=value_score_ids)
-        # next_tokens = next_tokens.gather(dim=1, index=value_score_ids)
-
-        # Todo: Apply length normalization on scores. self.contribution_factor / num_step ** length_penalty?
-        value_incorporated_scores = self.contribution_factor * scores + (1 - self.contribution_factor) * values
+        # ToDo: Would this normalization cover decoder only models (e.g. GPT-2)?
+        # ToDo: Could normalizing here be problematic?
+        normalization_factor = (input_ids.shape[-1] + 1) ** self.length_penalty
+        value_incorporated_scores = self.contribution_factor * scores / normalization_factor \
+                                    + (1 - self.contribution_factor) * values
 
         # Choose next indices and next tokens according to value_incorporated_scores
         value_incorporated_scores = value_incorporated_scores.view(-1, self.num_beams * self.num_tokens_per_beam)
@@ -685,11 +666,11 @@ class ValueLogitsProcessor(LogitsProcessor):
         next_token_value_incorporated_scores, next_tokens_indices = torch.topk(
             value_incorporated_scores, 2 * self.num_beams, dim=1, largest=True, sorted=True
         )
-        # Todo: Double check that indexing is done correctly
-        next_token_scores = scores.view(-1, self.num_beams * self.num_tokens_per_beam)\
+
+        next_token_scores = scores.view(-1, self.num_beams * self.num_tokens_per_beam) \
             .gather(dim=1, index=next_tokens_indices)
         next_indices = (next_tokens_indices / self.num_tokens_per_beam).long()
-        next_tokens = next_preliminary_tokens.view(-1, self.num_beams * self.num_tokens_per_beam)\
+        next_tokens = next_preliminary_tokens.view(-1, self.num_beams * self.num_tokens_per_beam) \
             .gather(dim=1, index=next_tokens_indices)
 
         return next_token_value_incorporated_scores, next_token_scores, next_indices, next_tokens
