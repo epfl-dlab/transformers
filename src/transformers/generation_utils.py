@@ -762,7 +762,7 @@ class GenerationMixin:
         prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
         tokens_considered_by_value_processor: int = None,
         value_model=None,
-        value_model_kwargs=None,
+        value_model_kwargs={},
         contribution_factor: Optional[float] = 0.5,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
