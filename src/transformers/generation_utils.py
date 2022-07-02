@@ -1641,7 +1641,7 @@ class GenerationMixin:
                 )
             states = outputs.past_key_values if "past_key_values" in outputs else None
 
-            logits: torch.Tensor = outputs.logits[:, -1, :]
+            logits: torch.Tensor = outputs.logits[:, -1, :].float()
             logits = logits_processor(original_token_ids, logits)
             priors = F.softmax(logits, dim=-1).detach().cpu().numpy()
 
@@ -1655,7 +1655,7 @@ class GenerationMixin:
 
     def pplmcts_rec_fun(
             self, logits_processor, model_kwargs, mcts_fp16, value_model, value_model_kwargs, value_cache, pad_token_id,
-            # PPLMCTS arghuments below
+            # PPLMCTS arguments below
             mcts_object: NumpyMCTS,
             original_states: List[List[torch.Tensor]],
             classi_states: Optional[List[List[torch.Tensor]]],
@@ -1691,83 +1691,97 @@ class GenerationMixin:
                 )
             next_states = outputs.past_key_values if "past_key_values" in outputs else None
 
-            logits: torch.Tensor = outputs.logits[:, -1, :]
+            logits: torch.Tensor = outputs.logits[:, -1, :].float()
             logits = logits_processor(original_token_ids, logits)
             priors = F.softmax(logits, dim=-1).detach().cpu().numpy()
 
         # Use of our discriminator to get values
-        with torch.no_grad():
-            with torch.cuda.amp.autocast() if mcts_fp16 else ExitStack():
-                classi_past_key_values = None
-                if "next_token_ids" not in inspect.signature(value_model.evaluate).parameters.keys():
-                    # ~~~ Simple value models ~~~ #
+        classi_past_key_values = None
+        if "next_token_ids" not in inspect.signature(value_model.evaluate).parameters.keys():
+            # ~~~ Simple value models ~~~ #
+            with torch.no_grad():
+                with torch.cuda.amp.autocast() if mcts_fp16 else ExitStack():
                     values = value_model.evaluate(
                         original_token_ids.tolist(),
                         likelihood=likelihoods,
                         **value_model_kwargs,
                     )
+            if isinstance(values, torch.Tensor):
+                values = values.float()
+                values = values.cpu().numpy()
+            else:
+                values = values.astype(np.float32)
+        else:
+            # ~~~ Complicated value models ~~~ #
+            # 1. Fetch necessary data
+            next_token_ids = mcts_object._topk_mapping[mcts_object._batch_range, parent_nodes]
+            next_token_ids = torch.tensor(next_token_ids, device=original_token_ids.device)
+            padded_parent_token_ids = original_token_ids[:, :-1]
+            parent_indices = [
+                tuple(mcts_object._original_token_ids[(b, n)].tolist())
+                for b, n in zip(mcts_object._batch_range, parent_nodes)
+            ]
+            likelihoods = torch.tensor(likelihoods, device=original_token_ids.device)
+
+            # 2. Prepare value_model forward pass and skip cached values
+            parent_idx_for_processing = []
+            padded_parent_token_ids_for_processing = []
+            next_token_ids_for_processing = []
+            likelihoods_for_processing = []
+            for parent_idx, parent_ids, ids, topk, l in zip(
+                    parent_indices,
+                    padded_parent_token_ids,
+                    original_token_ids,
+                    next_token_ids,
+                    likelihoods,
+            ):
+                if parent_idx in value_cache:
+                    assert ids[-1] == pad_token_id or ids[-1] in topk
+                    continue
                 else:
-                    # ~~~ Complicated value models ~~~ #
-                    # 1. Fetch necessary data
-                    next_token_ids = mcts_object._topk_mapping[mcts_object._batch_range, parent_nodes]
-                    next_token_ids = torch.tensor(next_token_ids, device=original_token_ids.device)
-                    padded_parent_token_ids = original_token_ids[:, :-1]
-                    parent_indices = [
-                        tuple(mcts_object._original_token_ids[(b, n)].tolist())
-                        for b, n in zip(mcts_object._batch_range, parent_nodes)
-                    ]
-                    likelihoods = torch.tensor(likelihoods, device=original_token_ids.device)
+                    parent_idx_for_processing.append(parent_idx)
+                    padded_parent_token_ids_for_processing.append(parent_ids[None, ...])
+                    next_token_ids_for_processing.append(topk[None, ...])
+                    likelihoods_for_processing.append(l[None, ...])
 
-                    # 2. Prepare value_model forward pass and skip cached values
-                    parent_idx_for_processing = []
-                    padded_parent_token_ids_for_processing = []
-                    next_token_ids_for_processing = []
-                    likelihoods_for_processing = []
-                    for parent_idx, parent_ids, ids, topk, l in zip(
-                            parent_indices,
-                            padded_parent_token_ids,
-                            original_token_ids,
-                            next_token_ids,
-                            likelihoods,
-                    ):
-                        if parent_idx in value_cache:
-                            assert ids[-1] == pad_token_id or ids[-1] in topk
-                            continue
-                        else:
-                            parent_idx_for_processing.append(parent_idx)
-                            padded_parent_token_ids_for_processing.append(parent_ids[None, ...])
-                            next_token_ids_for_processing.append(topk[None, ...])
-                            likelihoods_for_processing.append(l[None, ...])
-
-                    # 3. Value model forward pass
-                    if len(padded_parent_token_ids_for_processing) > 0:
+            # 3. Value model forward pass
+            if len(padded_parent_token_ids_for_processing) > 0:
+                with torch.no_grad():
+                    with torch.cuda.amp.autocast() if mcts_fp16 else ExitStack():
                         children_values = value_model.evaluate(
                             torch.cat(padded_parent_token_ids_for_processing),
                             next_token_ids=torch.cat(next_token_ids_for_processing),
                             likelihood=torch.cat(likelihoods_for_processing),
                             **value_model_kwargs,
                         )
-                        # 4. Update cache by forward pass results
-                        for parent_idx, v, topk in zip(
-                                parent_idx_for_processing, children_values, next_token_ids_for_processing
-                        ):
-                            topk = topk.squeeze(0)
-                            value_cache[parent_idx] = {"children_values": v, "topk": topk}
 
-                    # 5. Create the values to be returned by unpacking from cache
-                    values = []
-                    for parent_idx, child_token, topk in zip(
-                            parent_indices,
-                            original_token_ids[:, -1],
-                            next_token_ids,
-                    ):
-                        child_idx = (topk == child_token).nonzero(as_tuple=True)[0]
-                        if child_idx.numel() == 0:
-                            assert child_token == pad_token_id
-                            value = float("-inf")
-                        else:
-                            value = value_cache[parent_idx]["children_values"][child_idx.item()]
-                        values.append(value)
+                if isinstance(children_values, torch.Tensor):
+                    children_values = children_values.float()
+                    children_values = children_values.cpu().numpy()
+                else:
+                    children_values = children_values.astype(np.float32)
+
+                # 4. Update cache by forward pass results
+                for parent_idx, v, topk in zip(
+                        parent_idx_for_processing, children_values, next_token_ids_for_processing
+                ):
+                    topk = topk.squeeze(0)
+                    value_cache[parent_idx] = {"children_values": v, "topk": topk}
+
+            # 5. Create the values to be returned by unpacking from cache
+            values = []
+            for parent_idx, child_token, topk in zip(
+                    parent_indices,
+                    original_token_ids[:, -1],
+                    next_token_ids,
+            ):
+                child_idx = (topk == child_token).nonzero(as_tuple=True)[0]
+                if child_idx.numel() == 0:
+                    assert child_token == pad_token_id
+                    value = float("-inf")
+                else:
+                    value = value_cache[parent_idx]["children_values"][child_idx.item()]
+                values.append(value)
 
         return priors, np.array(values), next_states, classi_past_key_values
 

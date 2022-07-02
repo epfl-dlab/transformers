@@ -52,7 +52,7 @@ def pad_sequences_to_left_states(sequences, padding_value=0, max_len=0):
     return out
 
 
-class NumpyMCTS():
+class NumpyMCTS:
     def __init__(self, root_fun, rec_fun, batch_size, num_simulations, num_actions, num_sparse_actions, pb_c_init,
                  lm_device, lm_caching=True, classifier_caching=False, argpartition_reproducibility=False):
         self._lm_device = lm_device
