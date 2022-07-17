@@ -2472,7 +2472,7 @@ class GenerationMixin:
                 next_token_scores, 2 * num_beams, dim=1, largest=True, sorted=True
             )
 
-            next_indices = (next_tokens / vocab_size).long()
+            next_indices = torch.div(next_tokens, vocab_size, rounding_mode='floor').long()
             next_tokens = next_tokens % vocab_size
 
             # stateless

@@ -669,7 +669,7 @@ class ValueLogitsProcessor(LogitsProcessor):
 
         next_token_scores = scores.view(-1, self.num_beams * self.num_tokens_per_beam) \
             .gather(dim=1, index=next_tokens_indices)
-        next_indices = (next_tokens_indices / self.num_tokens_per_beam).long()
+        next_indices = torch.div(next_tokens_indices, self.num_tokens_per_beam, rounding_mode='floor').long()
         next_tokens = next_preliminary_tokens.view(-1, self.num_beams * self.num_tokens_per_beam) \
             .gather(dim=1, index=next_tokens_indices)
 
