@@ -652,12 +652,12 @@ class ValueLogitsProcessor(LogitsProcessor):
 
         values = self.value_model.evaluate(input_ids=input_ids,
                                            next_token_ids=next_preliminary_tokens,
+                                           num_beams=self.num_beams,
                                            **kwargs)
 
-        # ToDo: Would this normalization cover decoder only models (e.g. GPT-2)?
-        # ToDo: Could normalizing here be problematic?
+        # ToDo: The normalized scores are exp-ed so that the range of both the score and the value is [0, 1]
         normalization_factor = (input_ids.shape[-1] + 1) ** self.length_penalty
-        value_incorporated_scores = self.contribution_factor * scores / normalization_factor \
+        value_incorporated_scores = self.contribution_factor * torch.exp(scores / normalization_factor) \
                                     + (1 - self.contribution_factor) * values
 
         # Choose next indices and next tokens according to value_incorporated_scores
