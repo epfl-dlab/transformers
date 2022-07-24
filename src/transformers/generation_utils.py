@@ -1736,8 +1736,7 @@ class GenerationMixin:
                 values = values.cpu().numpy()
             else:
                 values = values.astype(np.float32)
-            if len(values.shape) == 2:
-                values = values.squeeze(0)
+            values = values.squeeze(1)
         else:
             # ~~~ Complicated value models ~~~ #
             # These value models require the next_token_ids and the output for one next token will depend on the
