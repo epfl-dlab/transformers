@@ -1696,9 +1696,12 @@ class GenerationMixin:
             priors = F.softmax(logits, dim=-1).detach().cpu().numpy()
 
         # Use of our discriminator to get values
+        import src.mdp.evaluation_models
         classi_past_key_values = None
         if "next_token_ids" not in inspect.signature(value_model.evaluate).parameters.keys():
             # ~~~ Simple value models ~~~ #
+            # These value models do not require the next_token_ids and are therefore simpler
+            # and computationally less expensive to use with MCTS.
             with torch.no_grad():
                 with torch.cuda.amp.autocast() if mcts_fp16 else ExitStack():
                     values = value_model.evaluate(
@@ -1711,8 +1714,37 @@ class GenerationMixin:
                 values = values.cpu().numpy()
             else:
                 values = values.astype(np.float32)
+        elif isinstance(value_model, (
+            src.mdp.evaluation_models.OracleMT,
+            src.mdp.evaluation_models.NoisyOracleMT,
+            src.mdp.evaluation_models.OracleDetoxify,
+            src.mdp.evaluation_models.NoisyOracleDetoxify,
+        )):
+            # ~~~ Also Simple value models ~~~ #
+            # These value models require the next_token_ids, but the next_token_ids will not interfere with each other,
+            # and can therefore be computed separately.
+            with torch.no_grad():
+                with torch.cuda.amp.autocast() if mcts_fp16 else ExitStack():
+                    values = value_model.evaluate(
+                        original_token_ids[:, :-1],
+                        next_token_ids=original_token_ids[:, -1:],
+                        likelihood=likelihoods,
+                        **value_model_kwargs,
+                    )
+            if isinstance(values, torch.Tensor):
+                values = values.float()
+                values = values.cpu().numpy()
+            else:
+                values = values.astype(np.float32)
+            if len(values.shape) == 2:
+                values = values.squeeze(0)
         else:
             # ~~~ Complicated value models ~~~ #
+            # These value models require the next_token_ids and the output for one next token will depend on the
+            # value of other next token ids. Our MCTS varint does not support returning the values for all
+            # next_token_ids at once, and therefore we implement a caching workaround where the values for the next
+            # token ids will be saved in a tree cache and retrieved when needed.
+            #
             # 1. Fetch necessary data
             next_token_ids = mcts_object._topk_mapping[mcts_object._batch_range, parent_nodes]
             next_token_ids = torch.tensor(next_token_ids, device=original_token_ids.device)
