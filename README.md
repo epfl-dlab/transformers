@@ -1,3 +1,11 @@
+This codebase is a fork of [huggingface/transformers](https://github.com/huggingface/transformers)
+that adds the support for the following decoding methods: MCTS, Stochastic Beam Search, Value-Guided Beam Search.
+To see how the decoding methods are used, see
+[epfl-dlab/understanding-decoding](https://github.com/epfl-dlab/understanding-decoding).
+
+<p align="center"> *** </p>
+
+
 <!---
 Copyright 2020 The HuggingFace Team. All rights reserved.
 
@@ -16,7 +24,7 @@ limitations under the License.
 
 <p align="center">
     <br>
-    <img src="https://raw.githubusercontent.com/huggingface/transformers/master/docs/source/imgs/transformers_logo_name.png" width="400"/>
+    <img src="https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers_logo_name.png" width="400"/>
     <br>
 <p>
 <p align="center">
@@ -51,7 +59,7 @@ limitations under the License.
 </h3>
 
 <h3 align="center">
-    <a href="https://hf.co/course"><img src="https://raw.githubusercontent.com/huggingface/transformers/master/docs/source/imgs/course_banner.png"></a>
+    <a href="https://hf.co/course"><img src="https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/course_banner.png"></a>
 </h3>
 
 🤗 Transformers provides thousands of pretrained models to perform tasks on texts such as classification, information extraction, question answering, summarization, translation, text generation and more in over 100 languages. Its aim is to make cutting-edge NLP easier to use for everyone.
